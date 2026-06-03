@@ -6,11 +6,11 @@ import argparse
 
 # 将父目录添加到 sys.path，确保能正确导入 usvlib4ros 包
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+from usvlib4ros.navigation.usv_ros2_controller import Ros2Controller
 from usvlib4ros.navigation.usv_ros2_controller import Ros2Controller
 from usvlib4ros import GlobalData
 from usvlib4ros import USVAutoNavigationService
-from usvlib4ros.user.nav import DQN_NAV
+from usvlib4ros.user.nav_2 import PPONav
 
 
 def load_config():
@@ -43,7 +43,7 @@ class USVNavMain:
         rosCtrl = Ros2Controller(host=host, port=port, deviceId=deviceId, globalData=globalData)
         # navigationService = USVAutoNavigationService(rosCtrl=rosCtrl, globalData=globalData)
         # navigationService.startService()
-        nav = DQN_NAV(ros_ctrl=rosCtrl,global_data=globalData)
+        nav = PPONav(ros_ctrl=rosCtrl,global_data=globalData)
         nav.startService()
         pass
     pass
@@ -62,4 +62,3 @@ if __name__ == '__main__':
 
     while True:
         time.sleep(1)
-
