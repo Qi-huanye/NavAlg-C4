@@ -21,7 +21,7 @@ from usvlib4ros.user.PP0_1 import PPO, device
 
 # ==================== 超参数配置 ====================
 N_ACTIONS = 5          # 离散动作空间: +100°, -100°, +50°, -50°, 0°
-N_STATES = 96          # 状态维度: 前方180°激光点数(约92) + heading + distance + obstacle_min_range + obstacle_angle
+N_STATES = 94          # 状态维度: 前方180°激光点数(约92) + heading + distance + obstacle_min_range + obstacle_angle
 # 注意：若激光雷达总点数非184，需按 total//2 + 4 调整此值
 MEMORY_CAPACITY = 2000
 BATCH_SIZE = 128

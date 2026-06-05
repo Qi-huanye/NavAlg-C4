@@ -67,8 +67,8 @@ class ActorCritic(nn.Module):
             nn.Linear(256, 256),         # 第二层全连接
             nn.Tanh(),
             nn.Linear(256, action_dim),  # 输出层
-            # 如果是离散动作空间，最后添加 Softmax 转换为概率分布；连续空间则为恒等映射
-            nn.Softmax(dim=-1) if not has_continuous_action_space else nn.Identity()
+            # 如果是离散动作空间，最后添加 Softmax 转换为概率分布；连续空间则为tanh()映射到[-1,1]
+            nn.Softmax(dim=-1) if not has_continuous_action_space else nn.Tanh()
         )
 
         # ========== Critic 网络 ==========
@@ -112,7 +112,7 @@ class ActorCritic(nn.Module):
             action_mean = self.actor(state)
             cov_mat = torch.diag(self.action_var).unsqueeze(dim=0)  # 协方差矩阵 (action_dim, action_dim)
             dist = MultivariateNormal(action_mean, cov_mat)
-            
+
         else:
             # 离散动作空间：Actor 输出概率分布，需限制数值范围避免极值
             action_probs = torch.clamp(self.actor(state), min=1e-6, max=1 - 1e-6)

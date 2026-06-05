@@ -11,12 +11,12 @@ from usvlib4ros.navigation.route_plan_service import RoutePlanService
 from usvlib4ros.msg.global_data import GlobalData, DictToObject, Point, Constants
 from usvlib4ros.msg.parameter import Parameter
 from usvlib4ros.usvRosUtil import LogUtil
-from usvlib4ros.user.PP0_1 import PPO, device
+from usvlib4ros.user.PP0_2 import PPO, device
 
 # ==================== 超参数配置 ====================
-N_ACTIONS = 5          # 离散动作空间: +100°, -100°, +50°, -50°, 0°
-N_STATES = 94          # 状态维度: 前方180°激光点数(约92) + heading + distance + obstacle_min_range + obstacle_angle
-# 注意：若激光雷达总点数非184，需按 total//2 + 4 调整此值
+N_ACTIONS = 1          # 连续动作空间
+HAS_CONTINUOUS_ACTION = True  # 是否使用连续动作空间
+N_STATES = 95          # 状态维度: 前方180°激光点数(约90) + heading + distance + obstacle_min_range + obstacle_angle + degreeAship
 MEMORY_CAPACITY = 2000
 BATCH_SIZE = 128
 LR_ACTOR = 0.0003
@@ -24,7 +24,7 @@ LR_CRITIC = 0.001
 GAMMA = 0.99           # 折扣因子
 K_EPOCHS = 80          # PPO更新轮数
 EPS_CLIP = 0.2         # PPO裁剪系数
-ACTION_STD_INIT = 0.6  # 连续动作标准差初始化（当前未启用连续空间）
+ACTION_STD_INIT = 0.6  # 连续动作标准差初始化(当前未启用连续空间)
 MAX_EPOCH = 4000       # 最大训练轮数
 MAX_STEP_PER_EPISODE = 3000   # 每轮最大步数
 MAX_EPISODE_TIME = 300  # 每轮最大时间(秒)
@@ -33,7 +33,7 @@ CHECKPOINT_INTERVAL = 100  # 模型保存间隔(轮数)
 
 # ==================== 导航常量 ====================
 LASER_MAX_RANGE = 5.0        # 激光雷达有效最大距离(m)
-LASER_FRONT_HALF_DEG = 180   # 前方扫描扇区角度(度)，仅用于碰撞检测
+LASER_FRONT_HALF_DEG = 180   # 前方扫描扇区角度(度),仅用于碰撞检测
 COLLISION_DISTANCE = 0.6     # 碰撞判定阈值(m)
 ARRIVE_DISTANCE = 1.0        # 到达目标判定阈值(m)
 DEFAULT_SPEED = 1.0          # 默认速度(m/s)
@@ -41,6 +41,8 @@ OBSTACLE_SLOW_RANGE = 4.0    # 进入此范围开始减速(m)
 TARGET_SLOW_RANGE = 3.0      # 接近目标时减速阈值(m)
 ANGULAR_VELOCITY_MAX = 100   # 最大角速度(°/s)
 ACTION_TO_DEGREE_SCALE = 1   # 动作到转向角度的缩放因子
+ACTION_TO_DEGREE_CONTINOUS_SCALE = 100 # 连续动作映射到转向角度缩放因子
+CONTROL_DT = 0.1             # 控制周期(s),用于连续动作
 
 # ==================== 奖励权重 ====================
 REWARD_ARRIVE_BONUS = 1000      # 到达奖励
@@ -54,7 +56,7 @@ REWARD_WEIGHT_HEADING = 0.2     # 航向奖励权重
 
 @dataclass
 class StepResult:
-    """step函数返回值，替代原来的元组返回。"""
+    """step函数返回值,替代原来的元组返回。"""
     next_state: np.ndarray
     reward: float
     current_distance: float
@@ -81,10 +83,10 @@ class PPONav:
         # PPO智能体
         self.ppo_agent = PPO(
             N_STATES, N_ACTIONS, LR_ACTOR, LR_CRITIC,
-            GAMMA, K_EPOCHS, EPS_CLIP, False, ACTION_STD_INIT
+            GAMMA, K_EPOCHS, EPS_CLIP, HAS_CONTINUOUS_ACTION, ACTION_STD_INIT
         )
         self.next_state = None
-        self.action_size = N_ACTIONS  # 动作空间大小（用于角度映射）
+        self.action_size = N_ACTIONS  # 动作空间大小(用于角度映射)
 
         # 航线相关
         self.route = None
@@ -155,7 +157,7 @@ class PPONav:
                             break
 
                         if (time.time() - startTime) > MAX_EPISODE_TIME:
-                            LogUtil.info("本轮超时，提前结束")
+                            LogUtil.info("本轮超时,提前结束")
                             break
 
                         self.done = self.navigationHandler(self.next_state, epoch, step)
@@ -194,7 +196,7 @@ class PPONav:
 
     # ==================== 状态获取 ====================
 
-    def getState(self, scan, heading: float, current_distance: float) -> list:
+    def getState(self, scan, heading: float, current_distance: float , degreeAship: float) -> list:
         """
         从激光雷达和传感器数据提取状态向量。
 
@@ -202,9 +204,10 @@ class PPONav:
             scan: 2D激光雷达数据对象(.ranges属性)
             heading: 船体航向(rad)
             current_distance: 到目标点的直线距离(m)
+            degreeAship: 船对目标点的角度
 
         Returns:
-            状态向量 [laser_features..., heading, distance, obstacle_min_range, obstacle_angle]
+            状态向量 [laser_features..., heading, distance, obstacle_min_range, obstacle_angle ,degreeAship]
         """
         scan_range = self._extract_laser_features(scan)
         obstacle_min_range = round(min(scan_range), 2)
@@ -224,23 +227,23 @@ class PPONav:
         if self._is_last_waypoint_reached(current_distance):
             self.arrive = True
 
-        return scan_range + [heading, current_distance, obstacle_min_range, obstacle_angle]
+        return scan_range + [heading, current_distance, obstacle_min_range, obstacle_angle, degreeAship]
 
     def _extract_laser_features(self, scan) -> list:
         """
-        从激光雷达数据提取特征，仅取前方180°扇区用于碰撞检测。
+        从激光雷达数据提取特征,仅取前方180°扇区用于碰撞检测。
 
-        假设ROS LaserScan的ranges按角度顺序排列，中间索引对应船体正前方。
+        假设ROS LaserScan的ranges按角度顺序排列,中间索引对应船体正前方。
         取中间180°范围内的数据点。
         """
         total_points = len(scan.ranges)
-        # 前方180°占总扫描范围的一半，取数组中间部分
+        # 前方180°占总扫描范围的一半,取数组中间部分
         half_count = total_points // 2
         start_idx = half_count // 2          # 前90°起始索引
         end_idx = start_idx + half_count     # 后90°结束索引
 
         scan_range = []
-        for i in range(start_idx, end_idx):
+        for i in range(0, 180 ,2):
             value = scan.ranges[i]
             if value == float('Inf') or value is None or np.isnan(value) or value > LASER_MAX_RANGE:
                 scan_range.append(LASER_MAX_RANGE)
@@ -257,14 +260,17 @@ class PPONav:
 
     # ==================== 动作执行 ====================
 
-    def step(self, state: list, action: int, laser_scan, heading: float,
-             shipToNextWPDistance: float, max_distance: float) -> StepResult:
+    def step(self, state: list, action: int |float, laser_scan, heading: float,
+             shipToNextWPDistance: float,degreeAship: float, max_distance: float) -> StepResult:
         """
         执行动作并获取环境反馈。
 
         Returns:
             StepResult: 包含下一状态、奖励、控制指令等
         """
+        pose = self.global_data.scada_data.pose
+        if self.destPoint is not None:
+            print(f"target=({self.destPoint.lng:.6f},{self.destPoint.lat:.6f}) ship=({pose.lng:.6f},{pose.lat:.6f})")
         obstacle_min_range = state[-2]
         current_distance = state[-3]
 
@@ -272,8 +278,8 @@ class PPONav:
         adviseRotate, adviseSpeed = self._action_to_control(action, obstacle_min_range, current_distance)
 
         # 获取新状态
-        new_state = self.getState(laser_scan, heading, shipToNextWPDistance)
-        reward = self._compute_reward(new_state, action, max_distance)
+        new_state = self.getState(laser_scan, heading, shipToNextWPDistance, degreeAship)
+        reward = self._compute_reward(new_state, action, max_distance, degreeAship)
 
         return StepResult(
             next_state=np.asarray(new_state),
@@ -284,12 +290,18 @@ class PPONav:
             advised_heading=heading,
         )
 
-    def _action_to_control(self, action: int, obstacle_min_range: float,
+    def _action_to_control(self, action: float, obstacle_min_range: float,
                            current_distance: float) -> tuple:
-        """将离散动作映射为(转向百分比, 速度百分比)。"""
-        # 角度计算：将action映射到[-100, +100]度范围
-        ang_vel = ((self.action_size - 1) / 2 - action) * ANGULAR_VELOCITY_MAX / ((self.action_size - 1) / 2)
-        adviseRotate = round(ang_vel, 0) * ACTION_TO_DEGREE_SCALE
+        if HAS_CONTINUOUS_ACTION:
+            """将连续动作直接映射为转向百分比"""
+            # 映射到实际角速度(度/秒)
+            ang_vel = action * ANGULAR_VELOCITY_MAX
+            adviseRotate = round(ang_vel, 0)
+        else:
+            """将离散动作映射为(转向百分比, 速度百分比)。"""
+            # 角度计算：将action映射到[-100, +100]度范围
+            ang_vel = ((self.action_size - 1) / 2 - action) * ANGULAR_VELOCITY_MAX / ((self.action_size - 1) / 2)
+            adviseRotate = round(ang_vel, 0) * ACTION_TO_DEGREE_CONTINOUS_SCALE
 
         # 自适应速度
         adviseSpeed = DEFAULT_SPEED
@@ -303,7 +315,7 @@ class PPONav:
 
     # ==================== 奖励函数 ====================
 
-    def _compute_reward(self, state: list, action: int, max_distance: float) -> float:
+    def _compute_reward(self, state: list, action: int | float, max_distance: float, degreeAship: float) -> float:
         """计算综合奖励值。"""
         obstacle_min_range = state[-2]
         current_distance = state[-3]
@@ -317,7 +329,7 @@ class PPONav:
             self.max_distance = current_distance
 
         # 航向奖励
-        heading_reward = self._calc_heading_reward(action, heading, current_distance, max_distance)
+        heading_reward = self._calc_heading_reward(action, heading, current_distance, max_distance, degreeAship)
 
         # 障碍物/接近目标奖励
         obstacle_reward = 0.0
@@ -352,18 +364,29 @@ class PPONav:
         return reward * 2 if reward < 0 else reward * 5
 
     @staticmethod
-    def _calc_heading_reward(action: int, heading: float,
-                             current_distance: float, max_distance: float) -> float:
-        """计算航向对齐奖励。"""
-        yaw_rewards = []
-        pi = math.pi
-        for i in range(N_ACTIONS):
-            angle = -pi / 4 + heading + (pi / 8 * i) + pi / 2
-            tr = 1 - 4 * abs(0.5 - math.modf(0.25 + 0.5 * angle % (2 * pi) / pi)[0])
-            yaw_rewards.append(tr)
-
+    def _calc_heading_reward(action: int | float, heading: float,
+                             current_distance: float, max_distance: float, degreeAship: float) -> float:
         distance_rate = 2 ** (current_distance / max_distance) if max_distance > 0 else 1.0
-        return round(yaw_rewards[action] * 5, 2) * distance_rate
+        if not HAS_CONTINUOUS_ACTION:
+            """计算航向对齐奖励。"""
+            yaw_rewards = []
+            pi = math.pi
+            for i in range(N_ACTIONS):
+                angle = -pi / 4 + heading + (pi / 8 * i) + pi / 2
+                tr = 1 - 4 * abs(0.5 - math.modf(0.25 + 0.5 * angle % (2 * pi) / pi)[0])
+                yaw_rewards.append(tr)
+
+            return round(yaw_rewards[action] * 5, 2) * distance_rate
+        else:
+            """连续动作的航向奖励"""
+            angular_speed = action * ANGULAR_VELOCITY_MAX          # 度/秒
+            predicted_heading = heading + angular_speed * CONTROL_DT
+            predicted_heading = predicted_heading % 360
+            angle_diff = abs(predicted_heading - degreeAship)
+            angle_diff = min(angle_diff, 360 - angle_diff)         # 最小夹角 [0,180]
+            heading_reward = 1 - (angle_diff / 180.0)              # 完全对准为1,完全反向为0
+
+            return round(heading_reward, 2) * distance_rate
 
     # ==================== 导航处理 ====================
 
@@ -414,7 +437,7 @@ class PPONav:
         return isAuto, isReturn, lng, lat, heading, pose.speed, pose.rotate_speed
 
     def _update_navigation_target(self, pose_info: tuple):
-        """更新路径规划目标点，返回导航上下文。"""
+        """更新路径规划目标点,返回导航上下文。"""
         isAuto, isReturn, lng, lat, _, _, _ = pose_info
         self.routePlaneService.setCurrentPos(lng, lat, isReturn)
 
@@ -435,6 +458,8 @@ class PPONav:
             self.prevPointIndex = prevPointIndex
             self.prevPoint = self.route.points[prevPointIndex]
 
+            degreeAship = self.routePlaneService.degreeAShip
+
         except Exception as e:
             LogUtil.error(f"路径规划异常: {e}")
 
@@ -445,10 +470,11 @@ class PPONav:
         return {
             'nextPointIndex': nextPointIndex,
             'shipToNextWPDistance': shipToNextWPDistance,
+            'degreeAship' : degreeAship
         }
 
     def _wait_for_laser_data(self):
-        """等待新的激光雷达数据，超时返回None。"""
+        """等待新的激光雷达数据,超时返回None。"""
         laser_scan = self.get_laser_scan(timeout=2)
         if laser_scan is None:
             LogUtil.info("获取激光雷达数据超时(2s)")
@@ -463,7 +489,7 @@ class PPONav:
 
         # 初始化状态
         if state is None:
-            state = self.getState(laser_scan, heading, nav_context['shipToNextWPDistance'])
+            state = self.getState(laser_scan, heading, nav_context['shipToNextWPDistance'], nav_context['degreeAship'])
 
         state_tensor = torch.FloatTensor(state).to(device)
         action = self.ppo_agent.select_action(state_tensor)
@@ -471,7 +497,7 @@ class PPONav:
         # 执行动作
         result = self.step(
             state_tensor.cpu().numpy().tolist(), action,
-            laser_scan, heading, nav_context['shipToNextWPDistance'], self.max_distance
+            laser_scan, heading, nav_context['shipToNextWPDistance'], nav_context['degreeAship'],self.max_distance
         )
         self.next_state = result.next_state
 
@@ -542,7 +568,7 @@ class PPONav:
                     self.routePlaneService.wayPointRadius = param.value
 
     def setMonitorParameterValue(self):
-        """监控参数回调（待实现）。"""
+        """监控参数回调(待实现)。"""
         pass
 
     # ==================== 内部工具方法 ====================
@@ -558,7 +584,7 @@ class PPONav:
         return True
 
     def get_laser_scan(self, timeout: float):
-        """等待新的激光雷达数据，超时返回None。"""
+        """等待新的激光雷达数据,超时返回None。"""
         laser_start_time = time.time()
         while self.global_data.laser_data == self.last_laser_scan:
             time.sleep(0.1)
