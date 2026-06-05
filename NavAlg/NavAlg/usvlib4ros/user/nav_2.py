@@ -16,7 +16,7 @@ from usvlib4ros.user.PP0_2 import PPO, device
 # ==================== 超参数配置 ====================
 N_ACTIONS = 1          # 连续动作空间
 HAS_CONTINUOUS_ACTION = True  # 是否使用连续动作空间
-N_STATES = 95          # 状态维度: 前方180°激光点数(约90) + heading + distance + obstacle_min_range + obstacle_angle + degreeAship
+N_STATES = 94          # 状态维度: 前方180°激光点数(约90) + angel_diff + distance + obstacle_min_range + obstacle_angle
 MEMORY_CAPACITY = 2000
 BATCH_SIZE = 128
 LR_ACTOR = 0.0003
@@ -72,7 +72,7 @@ class PPONav:
 
     def startService(self):
         self.navThread = threading.Thread(target=self.run)
-        #self.navThread.setDaemon(True)
+        self.navThread.setDaemon(True)
         self.navThread.start()
 
     def __init__(self, ros_ctrl: Ros2Controller, global_data: GlobalData, xyzAxis: bool = True):
@@ -213,6 +213,9 @@ class PPONav:
         Returns:
             状态向量 [laser_features..., heading, distance, obstacle_min_range, obstacle_angle ,degreeAship]
         """
+
+        angle_diff = abs(heading - degreeAship)
+
         scan_range = self._extract_laser_features(scan)
         obstacle_min_range = round(min(scan_range), 2)
         obstacle_angle = np.argmin(scan_range)
@@ -231,7 +234,7 @@ class PPONav:
         if self._is_last_waypoint_reached(current_distance):
             self.arrive = True
 
-        return scan_range + [heading, current_distance, obstacle_min_range, obstacle_angle, degreeAship]
+        return scan_range + [angle_diff, current_distance, obstacle_min_range, obstacle_angle]
 
     def _extract_laser_features(self, scan) -> list:
         """
@@ -418,9 +421,9 @@ class PPONav:
             predicted_heading = predicted_heading % 360
             angle_diff = abs(predicted_heading - degreeAship)
             angle_diff = min(angle_diff, 360 - angle_diff)         # 最小夹角 [0,180]
-            heading_reward = 1 - (angle_diff / 180.0)              # 完全对准为1,完全反向为0
+            heading_reward = 1 - 2*(angle_diff / 180.0)              # [1,-1]
 
-            return round(heading_reward, 2) * distance_rate
+            return round(heading_reward, 2)
 
     # ==================== 导航处理 ====================
 

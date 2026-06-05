@@ -60,5 +60,8 @@ if __name__ == '__main__':
 
     USVNavMain.start(host, port, device_id)
 
-    while True:
-        time.sleep(1)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        sys.exit(0)

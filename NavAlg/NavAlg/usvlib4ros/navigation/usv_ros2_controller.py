@@ -69,6 +69,12 @@ class Ros2Controller:
 
     def __listenerDeviceStatusCallback(self, msgDict):
         self.globalData.device_data = DictToObject(**msgDict)
+        route_version = msgDict.get('route_version')
+        work_model = msgDict.get('work_model')
+        reset_status = msgDict.get('reset_status')
+        LogUtil.info(
+            f"[device-status] work_model={work_model} reset_status={reset_status} route_version={route_version}"
+        )
         parameterAdjusterDict = msgDict['parameter_adjuster']
         version = parameterAdjusterDict['version']
         subVersion = parameterAdjusterDict['subversion']
@@ -222,12 +228,36 @@ class Ros2Controller:
         response = self.deviceControllerSrvCall.callService(request)
         if response['code'] != 1:
             LogUtil.error(response['data'])
+            cached_route = self.globalData.route
+            cached_points = getattr(cached_route, "points", [])
+            if len(cached_points) > 0:
+                first_point = cached_points[0]
+                LogUtil.info(
+                    f"[getRoute:fallback] version={getattr(cached_route, 'version', 0.0)} "
+                    f"points={len(cached_points)} first=({first_point.lng:.6f},{first_point.lat:.6f})"
+                )
+            else:
+                LogUtil.info("[getRoute:fallback] version=0.0 points=0")
 
             return self.globalData.route
         else:
             data = response['data']
             data = json.loads(data)
-            return DictToObject(**data)
+            route = DictToObject(**data)
+            points = getattr(route, "points", [])
+            if len(points) > 0:
+                first_point = points[0]
+                LogUtil.info(
+                    f"[getRoute:service] version={getattr(route, 'version', 0.0)} "
+                    f"start={getattr(route, 'start_index', -1)} points={len(points)} "
+                    f"first=({first_point.lng:.6f},{first_point.lat:.6f})"
+                )
+            else:
+                LogUtil.info(
+                    f"[getRoute:service] version={getattr(route, 'version', 0.0)} "
+                    f"start={getattr(route, 'start_index', -1)} points=0"
+                )
+            return route
         pass
 
     def create_ship(self):
