@@ -10,7 +10,7 @@ from usvlib4ros.navigation.usv_ros2_controller import Ros2Controller
 from usvlib4ros.navigation.usv_ros2_controller import Ros2Controller
 from usvlib4ros import GlobalData
 from usvlib4ros import USVAutoNavigationService
-from usvlib4ros.user.nav import DQN_NAV
+from usvlib4ros.user.nav_2 import DQN_NAV
 
 
 def load_config():

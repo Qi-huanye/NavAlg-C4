@@ -107,6 +107,7 @@ class PPONav:
             wayPointRadius=self.arrive_distance, route=self.route
         )
         self.last_laser_scan = global_data.laser_data
+        self.route_version_checked = 0.0
 
     # ==================== 训练主循环 ====================
 
@@ -147,6 +148,8 @@ class PPONav:
                     # 初始化本轮状态
                     self._reset_episode_state()
                     self.global_data.route = self.route
+                    self.route_version_checked = getattr(self.route, "version", 0.0)
+                    self._log_route_snapshot("initial-load", self.route)
                     self.__reloadNavigationRoute(self.route)
 
                     # 本轮导航循环
@@ -160,6 +163,7 @@ class PPONav:
                             LogUtil.info("本轮超时,提前结束")
                             break
 
+                        self._check_route_update()
                         self.done = self.navigationHandler(self.next_state, epoch, step)
 
                         # 定期更新PPO
@@ -260,6 +264,31 @@ class PPONav:
 
     # ==================== 动作执行 ====================
 
+    def compute_bearing(self, lat1, lon1, lat2, lon2):
+        lat1_rad = math.radians(lat1)
+        lat2_rad = math.radians(lat2)
+        delta_lon = math.radians(lon2 - lon1)
+        
+        y = math.sin(delta_lon) * math.cos(lat2_rad)
+        x = (math.cos(lat1_rad) * math.sin(lat2_rad) -
+            math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(delta_lon))
+        bearing_rad = math.atan2(y, x)
+        bearing_deg = (math.degrees(bearing_rad) + 360) % 360
+        return bearing_deg
+
+    def _calc_distance_to_target(self, lng1: float, lat1: float, lng2: float, lat2: float) -> float:
+        rad_lat1 = math.radians(lat1)
+        rad_lat2 = math.radians(lat2)
+        delta_lat = rad_lat1 - rad_lat2
+        delta_lng = math.radians(lng1) - math.radians(lng2)
+        distance = 2 * math.asin(
+            math.sqrt(
+                math.sin(delta_lat / 2) ** 2
+                + math.cos(rad_lat1) * math.cos(rad_lat2) * math.sin(delta_lng / 2) ** 2
+            )
+        )
+        return round(distance * 6378.137 * 1000, 1)
+
     def step(self, state: list, action: int |float, laser_scan, heading: float,
              shipToNextWPDistance: float,degreeAship: float, max_distance: float) -> StepResult:
         """
@@ -269,8 +298,13 @@ class PPONav:
             StepResult: 包含下一状态、奖励、控制指令等
         """
         pose = self.global_data.scada_data.pose
+
         if self.destPoint is not None:
-            print(f"target=({self.destPoint.lng:.6f},{self.destPoint.lat:.6f}) ship=({pose.lng:.6f},{pose.lat:.6f})")
+            degree_text = f" degreeAship={degreeAship:.9f} "
+            print(
+                f"target=({self.destPoint.lng:.6f},{self.destPoint.lat:.6f}) "
+                f"ship=({pose.lng:.6f},{pose.lat:.6f}){degree_text}"
+            )
         obstacle_min_range = state[-2]
         current_distance = state[-3]
 
@@ -450,7 +484,7 @@ class PPONav:
                 prevPointIndex = nextPointIndex
 
             if nextPointIndex != self.destPointIndex or nextPoint != self.destPoint:
-                self.max_distance = self.routePlaneService.distanceMetersShip2NextWP
+                self.max_distance = 0.0
                 LogUtil.info(f"切换至航点[{nextPointIndex}]={nextPoint}, 距离={self.max_distance:.1f}m")
 
             self.destPointIndex = nextPointIndex
@@ -458,7 +492,11 @@ class PPONav:
             self.prevPointIndex = prevPointIndex
             self.prevPoint = self.route.points[prevPointIndex]
 
-            degreeAship = self.routePlaneService.degreeAShip
+            #现在的位置到目标点的距离和角度都是手算
+            shipToNextWPDistance = self._calc_distance_to_target(lng, lat, self.destPoint.lng, self.destPoint.lat)
+            degreeAship = self.compute_bearing(lat, lng, self.destPoint.lat, self.destPoint.lng)
+            if self.max_distance <= 0:
+                self.max_distance = shipToNextWPDistance
 
         except Exception as e:
             LogUtil.error(f"路径规划异常: {e}")
@@ -466,7 +504,6 @@ class PPONav:
         if self.destPointIndex == -1:
             return None
 
-        shipToNextWPDistance = self.routePlaneService.distanceMetersShip2NextWP
         return {
             'nextPointIndex': nextPointIndex,
             'shipToNextWPDistance': shipToNextWPDistance,
@@ -576,6 +613,40 @@ class PPONav:
     def __loadVehiclePoseInfo(self):
         """向后兼容接口。"""
         return self._load_vehicle_pose_info()
+
+    def _log_route_snapshot(self, tag: str, route):
+        points = getattr(route, "points", [])
+        route_version = getattr(route, "version", 0.0)
+        start_index = getattr(route, "start_index", -1)
+        if len(points) == 0:
+            LogUtil.info(f"[route:{tag}] version={route_version} start={start_index} points=0")
+            return
+
+        first_point = points[0]
+        LogUtil.info(
+            f"[route:{tag}] version={route_version} start={start_index} points={len(points)} "
+            f"first=({first_point.lng:.6f},{first_point.lat:.6f})"
+        )
+
+    def _check_route_update(self):
+        route_update_time = self.global_data.device_data.route_version
+        cached_route = self.global_data.route
+        cached_route_version = getattr(cached_route, "version", 0.0)
+
+        if route_update_time != cached_route_version:
+            LogUtil.info(
+                f"[route-check] device_route_version={route_update_time} "
+                f"cached_route_version={cached_route_version}, reloading route"
+            )
+            route = self.ros_ctrl.getRoute()
+            self.global_data.updateRouteInfo(routeUpdateTime=route.version, route=route)
+            self.__reloadNavigationRoute(route)
+            self.route_version_checked = route.version
+            self._reset_episode_state()
+            self._log_route_snapshot("reloaded", route)
+        elif cached_route_version != self.route_version_checked:
+            self.route_version_checked = cached_route_version
+            self._log_route_snapshot("cached-update", cached_route)
 
     def __reloadNavigationRoute(self, route) -> bool:
         """重新加载导航航线。"""
