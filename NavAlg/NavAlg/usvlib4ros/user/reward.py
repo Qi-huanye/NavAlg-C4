@@ -26,22 +26,19 @@ def compute_reward(
     state: list,
     action: int | float | list | tuple,
     max_distance: float,
-    degreeAship: float,
+    angle_diff: float,
     arrive: bool,
     done: bool,
     config: RewardConfig = DEFAULT_REWARD_CONFIG,
 ) -> float:
     obstacle_min_range = state[-2]
     current_distance = state[-3]
-    heading = state[-4]
-
     distance_reward = calc_distance_reward(current_distance, max_distance)
     heading_reward = calc_heading_reward(
         action=action,
-        heading=heading,
+        angle_diff=angle_diff if angle_diff is not None else state[-4],
         current_distance=current_distance,
         max_distance=max_distance,
-        degreeAship=degreeAship,
         config=config,
     )
 
@@ -67,11 +64,21 @@ def compute_reward(
 
 def _split_action(action: int | float | list | tuple) -> tuple[float, float]:
     """将动作统一拆成(转向, 速度)两维。"""
+    if hasattr(action, "tolist"):
+        action = action.tolist()
     if isinstance(action, (list, tuple)):
-        if len(action) >= 2:
-            return float(action[0]), float(action[1])
-        if len(action) == 1:
-            return float(action[0]), 0.0
+        flat = []
+        for item in action:
+            if hasattr(item, "tolist"):
+                item = item.tolist()
+            if isinstance(item, (list, tuple)):
+                flat.extend(float(x) for x in item)
+            else:
+                flat.append(float(item))
+        if len(flat) >= 2:
+            return float(flat[0]), float(flat[1])
+        if len(flat) == 1:
+            return float(flat[0]), 0.0
         return 0.0, 0.0
     return float(action), 0.0
 
@@ -85,10 +92,9 @@ def calc_distance_reward(current_distance: float, max_distance: float) -> float:
 
 def calc_heading_reward(
     action: int | float | list | tuple,
-    heading: float,
+    angle_diff: float,
     current_distance: float,
     max_distance: float,
-    degreeAship: float,
     config: RewardConfig = DEFAULT_REWARD_CONFIG,
 ) -> float:
     distance_rate = 2 ** (current_distance / max_distance) if max_distance > 0 else 1.0
@@ -98,14 +104,17 @@ def calc_heading_reward(
         yaw_rewards = []
         pi = math.pi
         for i in range(config.n_actions):
-            angle = -pi / 4 + heading + (pi / 8 * i) + pi / 2
+            angle = -pi / 4 + angle_diff + (pi / 8 * i) + pi / 2
             tr = 1 - 4 * abs(0.5 - math.modf(0.25 + 0.5 * angle % (2 * pi) / pi)[0])
             yaw_rewards.append(tr)
         return round(yaw_rewards[action] * 5, 2) * distance_rate
 
-    angular_speed = turn_action * config.angular_velocity_max
-    predicted_heading = (heading + angular_speed * config.control_dt) % 360
-    angle_diff = abs(predicted_heading - degreeAship)
-    angle_diff = min(angle_diff, 360 - angle_diff)
-    heading_reward = 1 - 2 * (angle_diff / 180.0)
+    predicted_angle_diff = _normalize_signed_angle_diff(
+        angle_diff - turn_action * config.angular_velocity_max * config.control_dt
+    )
+    heading_reward = 1 - 2 * (abs(predicted_angle_diff) / 180.0)
     return round(heading_reward, 2)
+
+
+def _normalize_signed_angle_diff(angle: float) -> float:
+    return (angle + 180) % 360 - 180

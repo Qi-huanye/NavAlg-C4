@@ -227,10 +227,3 @@ class GlobalData:
         self.navigation_output_data.status = int(status)
         self.navigation_output_data.time = time.time()
         pass
-
-
-if __name__ == "__main__":
-    data = {'id': 'Single Point', 'name': '单点', 'version': 1779327963679, 'desc': '', 'start_index': 0, 'points': [{'name': '', 'lng': 116.174315746387, 'lat': 39.7388280594258, 'high': 0.0, 'cruiseSpeed': 1.5}], 'obstacles': []}
-    d_Data = DictToObject(**data)
-    point = d_Data.points[0]
-    lng = point.lng
