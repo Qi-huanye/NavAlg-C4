@@ -445,7 +445,7 @@ class PPONav:
 
     @staticmethod
     def _calc_time_reward_weight(episode_elapsed_time: float) -> float:
-        """计算时间权重。时间等于<code>MAX_EPISODE_TIME<\code>时最小，为 0.5；等于 0 时最大，为 2.0。"""
+        """计算时间权重。时间等于 MAX_EPISODE_TIME 时最小，为 0.5；等于 0 时最大，为 2.0。"""
         time_ratio = episode_elapsed_time / MAX_EPISODE_TIME if MAX_EPISODE_TIME > 0 else 1.0
         time_ratio = max(0.0, min(time_ratio, 1.0))
         weight = 2.0 - 1.5 * time_ratio
