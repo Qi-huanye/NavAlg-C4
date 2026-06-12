@@ -12,11 +12,12 @@ from usvlib4ros.msg.global_data import GlobalData, DictToObject, Point, Constant
 from usvlib4ros.msg.parameter import Parameter
 from usvlib4ros.usvRosUtil import LogUtil
 from usvlib4ros.user.PP0_2 import PPO, device
+from usvlib4ros.user.reward import RewardConfig, compute_reward
 
 # ==================== 超参数配置 ====================
-N_ACTIONS = 1          # 连续动作空间
+N_ACTIONS = 2          # 连续动作空间
 HAS_CONTINUOUS_ACTION = True  # 是否使用连续动作空间
-N_STATES = 94          # 状态维度: 前方180°激光点数(约90) + angel_diff + distance + obstacle_min_range + obstacle_angle
+N_STATES = 96          # 状态维度: 前方180°激光点数(约90) + speed + rotated_speed + angel_diff + distance + obstacle_min_range + obstacle_angle
 MEMORY_CAPACITY = 2000
 BATCH_SIZE = 128
 LR_ACTOR = 0.0003
@@ -42,6 +43,7 @@ TARGET_SLOW_RANGE = 3.0      # 接近目标时减速阈值(m)
 ANGULAR_VELOCITY_MAX = 100   # 最大角速度(°/s)
 ACTION_TO_DEGREE_SCALE = 1   # 动作到转向角度的缩放因子
 ACTION_TO_DEGREE_CONTINOUS_SCALE = 100 # 连续动作映射到转向角度缩放因子
+ACTION_TO_SPEED_CONTINOUS_SCALE = 200 # 连续动作映射到速度缩放因子
 CONTROL_DT = 0.1             # 控制周期(s),用于连续动作
 
 # ==================== 奖励权重 ====================
@@ -108,7 +110,13 @@ class PPONav:
             wayPointRadius=self.arrive_distance, route=self.route
         )
         self.last_laser_scan = global_data.laser_data
-        self.route_version_checked = 0.0
+        self.reward_config = RewardConfig(
+            target_slow_range=TARGET_SLOW_RANGE,
+            angular_velocity_max=ANGULAR_VELOCITY_MAX,
+            control_dt=CONTROL_DT,
+            has_continuous_action=HAS_CONTINUOUS_ACTION,
+            n_actions=N_ACTIONS,
+        )
 
     # ==================== 训练主循环 ====================
 
@@ -149,8 +157,6 @@ class PPONav:
                     # 初始化本轮状态
                     self._reset_episode_state()
                     self.global_data.route = self.route
-                    self.route_version_checked = getattr(self.route, "version", 0.0)
-                    self._log_route_snapshot("initial-load", self.route)
                     self.__reloadNavigationRoute(self.route)
 
                     # 本轮导航循环
@@ -164,7 +170,6 @@ class PPONav:
                             LogUtil.info("本轮超时,提前结束")
                             break
 
-                        self._check_route_update()
                         self.done = self.navigationHandler(self.next_state, epoch, step)
 
                         # 定期更新PPO
@@ -201,7 +206,7 @@ class PPONav:
 
     # ==================== 状态获取 ====================
 
-    def getState(self, scan, heading: float, current_distance: float , degreeAship: float) -> list:
+    def getState(self, scan, heading: float, current_distance: float , degreeAship: float, current_speed: float, current_rotate_speed: float) -> list:
         """
         从激光雷达和传感器数据提取状态向量。
 
@@ -215,7 +220,9 @@ class PPONav:
             状态向量 [laser_features..., heading, distance, obstacle_min_range, obstacle_angle ,degreeAship]
         """
 
-        angle_diff = abs(heading - degreeAship)
+        heading_abs = self._normalize_heading_360(heading)
+        target_abs = self._normalize_heading_360(degreeAship)
+        angle_diff = self._normalize_signed_angle_diff(target_abs - heading_abs)
 
         scan_range = self._extract_laser_features(scan)
         obstacle_min_range = round(min(scan_range), 2)
@@ -235,7 +242,7 @@ class PPONav:
         if self._is_last_waypoint_reached(current_distance):
             self.arrive = True
 
-        return scan_range + [angle_diff, current_distance, obstacle_min_range, obstacle_angle]
+        return scan_range + [current_speed, current_rotate_speed, angle_diff, current_distance, obstacle_min_range, obstacle_angle]
 
     def _extract_laser_features(self, scan) -> list:
         """
@@ -280,6 +287,14 @@ class PPONav:
         bearing_deg = (math.degrees(bearing_rad) + 360) % 360
         return bearing_deg
 
+    @staticmethod
+    def _normalize_heading_360(angle: float) -> float:
+        return angle % 360
+
+    @staticmethod
+    def _normalize_signed_angle_diff(angle: float) -> float:
+        return (angle + 180) % 360 - 180
+
     def _calc_distance_to_target(self, lng1: float, lat1: float, lng2: float, lat2: float) -> float:
         rad_lat1 = math.radians(lat1)
         rad_lat2 = math.radians(lat2)
@@ -293,7 +308,7 @@ class PPONav:
         )
         return round(distance * 6378.137 * 1000, 1)
 
-    def step(self, state: list, action: int |float, laser_scan, heading: float,
+    def step(self, state: list, action: np.ndarray, laser_scan, heading: float,
              shipToNextWPDistance: float,degreeAship: float, max_distance: float) -> StepResult:
         """
         执行动作并获取环境反馈。
@@ -316,8 +331,21 @@ class PPONav:
         adviseRotate, adviseSpeed = self._action_to_control(action, obstacle_min_range, current_distance)
 
         # 获取新状态
-        new_state = self.getState(laser_scan, heading, shipToNextWPDistance, degreeAship)
-        reward = self._compute_reward(new_state, action, max_distance, degreeAship)
+        pose = self.global_data.scada_data.pose
+        new_state = self.getState(laser_scan, heading, shipToNextWPDistance, degreeAship, pose.speed, pose.rotate_speed)
+        reward = compute_reward(
+            state=new_state,
+            action=action,
+            max_distance=max_distance,
+            angle_diff=new_state[-4],
+            arrive=self.arrive,
+            done=self.done,
+            config=self.reward_config,
+        )
+        if self.arrive:
+            LogUtil.info("到达目标!")
+        elif self.done:
+            LogUtil.info("发生碰撞!")
 
         return StepResult(
             next_state=np.asarray(new_state),
@@ -328,36 +356,52 @@ class PPONav:
             advised_heading=heading,
         )
 
-    def _action_to_control(self, action: float, obstacle_min_range: float,
+    def _action_to_control(self, action: np.ndarray, obstacle_min_range: float,
                            current_distance: float) -> tuple:
         if HAS_CONTINUOUS_ACTION:
             """将连续动作直接映射为转向百分比"""
             # 映射到实际角速度(度/秒)
-            ang_vel = action * ANGULAR_VELOCITY_MAX
+            action_vec = np.asarray(action, dtype=np.float32).reshape(-1)
+            if action_vec.size < 2:
+                raise ValueError(f"continuous action must have at least 2 elements, got shape={np.asarray(action).shape}")
+            turn_ratio = float(action_vec[0])
+            speed_ratio = float(action_vec[1])
+            ang_vel = turn_ratio * ANGULAR_VELOCITY_MAX
             adviseRotate = round(ang_vel, 0)
+
+            # 自适应速度
+            adviseSpeed = speed_ratio * ACTION_TO_SPEED_CONTINOUS_SCALE
+
+            if obstacle_min_range < 1.0:
+                adviseSpeed = min(adviseSpeed, ACTION_TO_SPEED_CONTINOUS_SCALE * 0.2)
+            elif obstacle_min_range < 2.0:
+                adviseSpeed = min(adviseSpeed, ACTION_TO_SPEED_CONTINOUS_SCALE * 0.4)
+
+            if current_distance < TARGET_SLOW_RANGE:
+                adviseSpeed = min(adviseSpeed, ACTION_TO_SPEED_CONTINOUS_SCALE * 0.3)
+
         else:
             """将离散动作映射为(转向百分比, 速度百分比)。"""
             # 角度计算：将action映射到[-100, +100]度范围
             ang_vel = ((self.action_size - 1) / 2 - action) * ANGULAR_VELOCITY_MAX / ((self.action_size - 1) / 2)
             adviseRotate = round(ang_vel, 0) * ACTION_TO_DEGREE_CONTINOUS_SCALE
+             # 自适应速度
+            adviseSpeed = DEFAULT_SPEED
+            if obstacle_min_range < OBSTACLE_SLOW_RANGE:
+                adviseSpeed = 0.1
+            if current_distance < TARGET_SLOW_RANGE:
+                adviseSpeed = 0.1
+            adviseSpeed = min(round(adviseSpeed * 100 / DEFAULT_SPEED, 0), 100)
 
-        # 自适应速度
-        adviseSpeed = DEFAULT_SPEED
-        if obstacle_min_range < OBSTACLE_SLOW_RANGE:
-            adviseSpeed = 0.1
-        if current_distance < TARGET_SLOW_RANGE:
-            adviseSpeed = 0.1
-
-        adviseSpeed = min(round(adviseSpeed * 100 / DEFAULT_SPEED, 0), 100)
         return adviseRotate, adviseSpeed
 
     # ==================== 奖励函数 ====================
 
-    def _compute_reward(self, state: list, action: int | float, max_distance: float, degreeAship: float) -> float:
+    def _compute_reward(self, state: list, action: np.ndarray, max_distance: float, angle_diff: float) -> float:
         """计算综合奖励值。"""
         obstacle_min_range = state[-2]
         current_distance = state[-3]
-        heading = state[-4]
+        angle_diff_state = state[-4]
 
         # 距离奖励
         distance_reward = self._calc_distance_reward(current_distance, max_distance)
@@ -367,7 +411,7 @@ class PPONav:
             self.max_distance = current_distance
 
         # 航向奖励
-        heading_reward = self._calc_heading_reward(action, heading, current_distance, max_distance, degreeAship)
+        heading_reward = self._calc_heading_reward(action, angle_diff_state, current_distance, max_distance, angle_diff)
 
         # 障碍物/接近目标奖励
         obstacle_reward = 0.0
@@ -416,27 +460,24 @@ class PPONav:
         return reward * 2 if reward < 0 else reward * 5
 
     @staticmethod
-    def _calc_heading_reward(action: int | float, heading: float,
-                             current_distance: float, max_distance: float, degreeAship: float) -> float:
+    def _calc_heading_reward(action: np.ndarray, angle_diff_state: float,
+                             current_distance: float, max_distance: float, angle_diff: float) -> float:
         distance_rate = 2 ** (current_distance / max_distance) if max_distance > 0 else 1.0
         if not HAS_CONTINUOUS_ACTION:
             """计算航向对齐奖励。"""
             yaw_rewards = []
             pi = math.pi
             for i in range(N_ACTIONS):
-                angle = -pi / 4 + heading + (pi / 8 * i) + pi / 2
+                angle = -pi / 4 + angle_diff_state + (pi / 8 * i) + pi / 2
                 tr = 1 - 4 * abs(0.5 - math.modf(0.25 + 0.5 * angle % (2 * pi) / pi)[0])
                 yaw_rewards.append(tr)
 
-            return round(yaw_rewards[action] * 5, 2) * distance_rate
+            return round(yaw_rewards[action[0]] * 5, 2) * distance_rate
         else:
             """连续动作的航向奖励"""
-            angular_speed = action * ANGULAR_VELOCITY_MAX          # 度/秒
-            predicted_heading = heading + angular_speed * CONTROL_DT
-            predicted_heading = predicted_heading % 360
-            angle_diff = abs(predicted_heading - degreeAship)
-            angle_diff = min(angle_diff, 360 - angle_diff)         # 最小夹角 [0,180]
-            heading_reward = 1 - 2*(angle_diff / 180.0)              # [1,-1]
+            angular_speed = action[0] * ANGULAR_VELOCITY_MAX          # 度/秒
+            predicted_angle_diff = (angle_diff - angular_speed * CONTROL_DT + 180) % 360 - 180
+            heading_reward = 1 - 2 * (abs(predicted_angle_diff) / 180.0)  # [1,-1]
 
             return round(heading_reward, 2)
 
@@ -541,10 +582,13 @@ class PPONav:
                            laser_scan, nav_context: dict) -> bool:
         """PPO核心决策逻辑。"""
         heading = self._get_current_heading()
+        pose = self.global_data.scada_data.pose
+        current_speed = pose.speed
+        current_rotate_speed = pose.rotate_speed
 
         # 初始化状态
         if state is None:
-            state = self.getState(laser_scan, heading, nav_context['shipToNextWPDistance'], nav_context['degreeAship'])
+            state = self.getState(laser_scan, heading, nav_context['shipToNextWPDistance'], nav_context['degreeAship'], current_speed, current_rotate_speed)
 
         state_tensor = torch.FloatTensor(state).to(device)
         action = self.ppo_agent.select_action(state_tensor)
@@ -631,40 +675,6 @@ class PPONav:
     def __loadVehiclePoseInfo(self):
         """向后兼容接口。"""
         return self._load_vehicle_pose_info()
-
-    def _log_route_snapshot(self, tag: str, route):
-        points = getattr(route, "points", [])
-        route_version = getattr(route, "version", 0.0)
-        start_index = getattr(route, "start_index", -1)
-        if len(points) == 0:
-            LogUtil.info(f"[route:{tag}] version={route_version} start={start_index} points=0")
-            return
-
-        first_point = points[0]
-        LogUtil.info(
-            f"[route:{tag}] version={route_version} start={start_index} points={len(points)} "
-            f"first=({first_point.lng:.6f},{first_point.lat:.6f})"
-        )
-
-    def _check_route_update(self):
-        route_update_time = self.global_data.device_data.route_version
-        cached_route = self.global_data.route
-        cached_route_version = getattr(cached_route, "version", 0.0)
-
-        if route_update_time != cached_route_version:
-            LogUtil.info(
-                f"[route-check] device_route_version={route_update_time} "
-                f"cached_route_version={cached_route_version}, reloading route"
-            )
-            route = self.ros_ctrl.getRoute()
-            self.global_data.updateRouteInfo(routeUpdateTime=route.version, route=route)
-            self.__reloadNavigationRoute(route)
-            self.route_version_checked = route.version
-            self._reset_episode_state()
-            self._log_route_snapshot("reloaded", route)
-        elif cached_route_version != self.route_version_checked:
-            self.route_version_checked = cached_route_version
-            self._log_route_snapshot("cached-update", cached_route)
 
     def __reloadNavigationRoute(self, route) -> bool:
         """重新加载导航航线。"""

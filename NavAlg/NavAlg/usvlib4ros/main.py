@@ -36,16 +36,34 @@ def parse_args():
 
 
 class USVNavMain:
+    rosCtrl = None
+    globalData = None
 
     @classmethod
     def start(cls,host,port,deviceId):
         globalData = GlobalData().getInstance()
         rosCtrl = Ros2Controller(host=host, port=port, deviceId=deviceId, globalData=globalData)
+        cls.globalData = globalData
+        cls.rosCtrl = rosCtrl
         # navigationService = USVAutoNavigationService(rosCtrl=rosCtrl, globalData=globalData)
         # navigationService.startService()
         nav = DQN_NAV(ros_ctrl=rosCtrl,global_data=globalData)
         nav.startService()
         pass
+
+    @classmethod
+    def shutdown(cls):
+        if cls.globalData is not None:
+            cls.globalData.updateThrottleRudderOutput(0, 0, 0, 0, 0)
+            cls.globalData.updateAlgorithmOutput(0, 0, 0, 0, 0, 0)
+
+        if cls.rosCtrl is not None:
+            try:
+                time.sleep(0.2)
+                cls.rosCtrl.set_ready_work()
+                time.sleep(0.2)
+            except Exception:
+                pass
     pass
 
 if __name__ == '__main__':
@@ -64,4 +82,5 @@ if __name__ == '__main__':
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
+        USVNavMain.shutdown()
         sys.exit(0)
