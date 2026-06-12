@@ -76,6 +76,7 @@ class PPONav:
         self.navThread.start()
 
     def __init__(self, ros_ctrl: Ros2Controller, global_data: GlobalData, xyzAxis: bool = True):
+        self.episode_start_time = None
         self.ros_ctrl: Ros2Controller = ros_ctrl
         self.global_data: GlobalData = global_data
         self.navThread = None
@@ -153,13 +154,13 @@ class PPONav:
                     self.__reloadNavigationRoute(self.route)
 
                     # 本轮导航循环
-                    startTime = time.time()
+                    self.episode_start_time = time.time()
                     for step in range(MAX_STEP_PER_EPISODE):
                         if self.global_data.device_data.task_status == 0:
                             LogUtil.info(f"步骤 {step} 停止训练")
                             break
 
-                        if (time.time() - startTime) > MAX_EPISODE_TIME:
+                        if (time.time() - self.episode_start_time) > MAX_EPISODE_TIME:
                             LogUtil.info("本轮超时,提前结束")
                             break
 
@@ -385,12 +386,26 @@ class PPONav:
         # 终止奖励/惩罚
         if self.arrive:
             LogUtil.info("到达目标!")
-            reward += REWARD_ARRIVE_BONUS
+
+            # 计算自此轮训练开始的时间
+            episode_elapsed_time = time.time() - self.episode_start_time
+            # 时间奖励权重
+            time_reward_weight = self._calc_time_reward_weight(episode_elapsed_time)
+
+            reward += REWARD_ARRIVE_BONUS * time_reward_weight
         elif self.done:
             LogUtil.info("发生碰撞!")
             reward += REWARD_COLLISION_PENALTY
 
         return reward
+
+    @staticmethod
+    def _calc_time_reward_weight(episode_elapsed_time: float) -> float:
+        """计算时间权重。时间等于<code>MAX_EPISODE_TIME<\code>时最小，为 0.5；等于 0 时最大，为 2.0。"""
+        time_ratio = episode_elapsed_time / MAX_EPISODE_TIME if MAX_EPISODE_TIME > 0 else 1.0
+        time_ratio = max(0.0, min(time_ratio, 1.0))
+        weight = 2.0 - 1.5 * time_ratio
+        return max(0.5, min(weight, 2.0))
 
     @staticmethod
     def _calc_distance_reward(current_distance: float, max_distance: float) -> float:
