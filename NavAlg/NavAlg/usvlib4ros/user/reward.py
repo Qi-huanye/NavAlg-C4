@@ -6,7 +6,6 @@ from dataclasses import dataclass
 class RewardConfig:
     reward_arrive_bonus: float = 1000
     reward_collision_penalty: float = -500
-    reward_obstacle_penalty: float = -5
     reward_near_target_bonus: float = 1
     reward_weight_distance: float = 0.6
     reward_weight_obstacle: float = 0.2
@@ -17,9 +16,21 @@ class RewardConfig:
     has_continuous_action: bool = True
     n_actions: int = 1
     speed_scale: float = 100.0
+    apf_attractive_gain: float = 1.0
+    apf_repulsive_gain: float = 8.0
+    apf_obstacle_influence_range: float = 3.0
+    apf_heading_repulsive_weight: float = 1.0
 
 
 DEFAULT_REWARD_CONFIG = RewardConfig()
+
+
+@dataclass(frozen=True)
+class RewardBreakdown:
+    distance_reward: float
+    heading_reward: float
+    obstacle_reward: float
+    total_reward: float
 
 
 def compute_reward(
@@ -29,37 +40,68 @@ def compute_reward(
     angle_diff: float,
     arrive: bool,
     done: bool,
+    prev_distance: float | None = None,
     config: RewardConfig = DEFAULT_REWARD_CONFIG,
 ) -> float:
+    return compute_reward_breakdown(
+        state=state,
+        action=action,
+        max_distance=max_distance,
+        angle_diff=angle_diff,
+        arrive=arrive,
+        done=done,
+        prev_distance=prev_distance,
+        config=config,
+    ).total_reward
+
+
+def compute_reward_breakdown(
+    state: list,
+    action: int | float | list | tuple,
+    max_distance: float,
+    angle_diff: float,
+    arrive: bool,
+    done: bool,
+    prev_distance: float | None = None,
+    config: RewardConfig = DEFAULT_REWARD_CONFIG,
+) -> RewardBreakdown:
     obstacle_min_range = state[-2]
+    obstacle_angle = state[-1]
     current_distance = state[-3]
-    distance_reward = calc_distance_reward(current_distance, max_distance)
-    heading_reward = calc_heading_reward(
+    distance_reward_raw = calc_progress_reward(prev_distance, current_distance)
+    if prev_distance is None:
+        distance_reward_raw = calc_distance_reward(current_distance, max_distance)
+    heading_reward_raw = calc_apf_heading_reward(
         action=action,
         angle_diff=angle_diff if angle_diff is not None else state[-4],
         current_distance=current_distance,
         max_distance=max_distance,
+        obstacle_min_range=obstacle_min_range,
+        obstacle_angle=obstacle_angle,
         config=config,
     )
 
-    obstacle_reward = 0.0
-    if obstacle_min_range < 3:
-        obstacle_reward = config.reward_obstacle_penalty
-    elif current_distance < config.target_slow_range:
-        obstacle_reward = config.reward_near_target_bonus
+    obstacle_reward_raw = -calc_repulsive_potential(obstacle_min_range, config)
+    if current_distance < config.target_slow_range:
+        obstacle_reward_raw = config.reward_near_target_bonus
 
-    reward = (
-        distance_reward * config.reward_weight_distance
-        + obstacle_reward * config.reward_weight_obstacle
-        + heading_reward * config.reward_weight_heading
-    )
+    distance_reward = distance_reward_raw * config.reward_weight_distance
+    obstacle_reward = obstacle_reward_raw * config.reward_weight_obstacle
+    heading_reward = heading_reward_raw * config.reward_weight_heading
+
+    reward = distance_reward + obstacle_reward + heading_reward
 
     if arrive:
         reward += config.reward_arrive_bonus
     elif done:
         reward += config.reward_collision_penalty
 
-    return reward
+    return RewardBreakdown(
+        distance_reward=distance_reward,
+        heading_reward=heading_reward,
+        obstacle_reward=obstacle_reward,
+        total_reward=reward,
+    )
 
 
 def _split_action(action: int | float | list | tuple) -> tuple[float, float]:
@@ -90,6 +132,19 @@ def calc_distance_reward(current_distance: float, max_distance: float) -> float:
     return reward * 2 if reward < 0 else reward * 5
 
 
+def calc_progress_reward(prev_distance: float | None, current_distance: float) -> float:
+    """基于距离变化量的进度奖励。
+
+    前进则为正，远离目标则为负；数值尽量保持小而稳定，避免压过终止奖励。
+    """
+    if prev_distance is None:
+        return 0.0
+    if prev_distance <= 0:
+        return 0.0
+    progress = prev_distance - current_distance
+    return max(-1.0, min(1.0, progress / prev_distance))
+
+
 def calc_heading_reward(
     action: int | float | list | tuple,
     angle_diff: float,
@@ -114,6 +169,81 @@ def calc_heading_reward(
     )
     heading_reward = 1 - 2 * (abs(predicted_angle_diff) / 180.0)
     return round(heading_reward, 2)
+
+
+def calc_repulsive_potential(
+    obstacle_min_range: float,
+    config: RewardConfig = DEFAULT_REWARD_CONFIG,
+) -> float:
+    rho = max(float(obstacle_min_range), 1e-3)
+    rho_0 = config.apf_obstacle_influence_range
+    if rho >= rho_0:
+        return 0.0
+    return 0.5 * config.apf_repulsive_gain * ((1.0 / rho) - (1.0 / rho_0)) ** 2
+
+
+def calc_apf_heading_reward(
+    action: int | float | list | tuple,
+    angle_diff: float,
+    current_distance: float,
+    max_distance: float,
+    obstacle_min_range: float,
+    obstacle_angle: float,
+    config: RewardConfig = DEFAULT_REWARD_CONFIG,
+) -> float:
+    distance_rate = 2 ** (current_distance / max_distance) if max_distance > 0 else 1.0
+    turn_action, _ = _split_action(action)
+
+    if not config.has_continuous_action:
+        return calc_heading_reward(
+            action=action,
+            angle_diff=angle_diff,
+            current_distance=current_distance,
+            max_distance=max_distance,
+            config=config,
+        )
+
+    apf_heading_diff = calc_apf_heading_diff(
+        angle_diff=angle_diff,
+        current_distance=current_distance,
+        obstacle_min_range=obstacle_min_range,
+        obstacle_angle=obstacle_angle,
+        config=config,
+    )
+    predicted_heading_diff = _normalize_signed_angle_diff(
+        apf_heading_diff - turn_action * config.angular_velocity_max * config.control_dt
+    )
+    heading_reward = 1 - 2 * (abs(predicted_heading_diff) / 180.0)
+    return round(heading_reward, 2) * distance_rate
+
+
+def calc_apf_heading_diff(
+    angle_diff: float,
+    current_distance: float,
+    obstacle_min_range: float,
+    obstacle_angle: float,
+    config: RewardConfig = DEFAULT_REWARD_CONFIG,
+) -> float:
+    target_rad = math.radians(angle_diff)
+    attractive_strength = config.apf_attractive_gain * max(float(current_distance), 0.0)
+    attractive_x = attractive_strength * math.cos(target_rad)
+    attractive_y = attractive_strength * math.sin(target_rad)
+
+    repulsive_x = 0.0
+    repulsive_y = 0.0
+    potential = calc_repulsive_potential(obstacle_min_range, config)
+    if potential > 0.0:
+        obstacle_relative_deg = float(obstacle_angle) * 2.0 - 90.0
+        obstacle_rad = math.radians(obstacle_relative_deg)
+        repulsive_strength = potential * config.apf_heading_repulsive_weight
+        repulsive_x = -repulsive_strength * math.cos(obstacle_rad)
+        repulsive_y = -repulsive_strength * math.sin(obstacle_rad)
+
+    apf_x = attractive_x + repulsive_x
+    apf_y = attractive_y + repulsive_y
+    if abs(apf_x) < 1e-6 and abs(apf_y) < 1e-6:
+        return _normalize_signed_angle_diff(angle_diff)
+    return _normalize_signed_angle_diff(math.degrees(math.atan2(apf_y, apf_x)))
 
 
 def _normalize_signed_angle_diff(angle: float) -> float:

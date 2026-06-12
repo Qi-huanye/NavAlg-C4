@@ -1,4 +1,4 @@
-import math
+﻿import math
 import time
 import threading
 from dataclasses import dataclass
