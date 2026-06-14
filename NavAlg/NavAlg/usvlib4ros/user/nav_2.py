@@ -446,12 +446,15 @@ class PPONav:
 
     @staticmethod
     def _calc_time_reward_weight(episode_elapsed_time: float) -> float:
-        """计算时间权重。时间等于 MAX_EPISODE_TIME 时最小，为 0.0；等于 0 时最大，为 1.0。"""
-        diff = MAX_EPISODE_TIME - episode_elapsed_time
-        if MAX_EPISODE_TIME == 0:
-            return 0.0
-        normalized_diff = diff / MAX_EPISODE_TIME
-        return math.sqrt(normalized_diff) if 0 <= normalized_diff <= 1 else 0.0
+        """计算时间权重。时间等于 MAX_EPISODE_TIME 时最小，为 0.5；等于 0 时最大，为 1.0。"""
+        if MAX_EPISODE_TIME <= 0:
+            return 1.0
+
+        progress = episode_elapsed_time / MAX_EPISODE_TIME
+        progress = max(0.0, min(1.0, progress))
+
+        min_weight = 0.5
+        return min_weight + (1.0 - min_weight) * ((1.0 - progress) ** 2)
 
     @staticmethod
     def _calc_distance_reward(current_distance: float, max_distance: float) -> float:
