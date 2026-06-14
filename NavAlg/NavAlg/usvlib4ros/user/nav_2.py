@@ -2,7 +2,6 @@ import math
 import time
 import threading
 from dataclasses import dataclass
-from math import sqrt
 
 import numpy as np
 import torch
@@ -341,6 +340,8 @@ class PPONav:
             angle_diff=new_state[-4],
             arrive=self.arrive,
             done=self.done,
+            prev_distance=current_distance,
+            episode_elapsed_time=time.time() - self.episode_start_time,
             config=self.reward_config,
         )
         if self.arrive:
