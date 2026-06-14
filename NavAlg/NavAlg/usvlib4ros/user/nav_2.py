@@ -116,6 +116,7 @@ class PPONav:
             control_dt=CONTROL_DT,
             has_continuous_action=HAS_CONTINUOUS_ACTION,
             n_actions=N_ACTIONS,
+            max_episode_time=MAX_EPISODE_TIME,
         )
 
     # ==================== 训练主循环 ====================

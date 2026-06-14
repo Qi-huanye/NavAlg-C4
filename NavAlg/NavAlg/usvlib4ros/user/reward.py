@@ -14,6 +14,8 @@ class RewardConfig:
     obstacle_safe_range: float = 3.0
     obstacle_penalty_scale: float = 10.0
     step_penalty: float = -0.01
+    max_episode_time: float = 300.0
+    min_arrive_time_weight: float = 0.5
     target_slow_range: float = 3.0
     angular_velocity_max: float = 100
     control_dt: float = 0.1
@@ -33,6 +35,7 @@ def compute_reward(
     arrive: bool,
     done: bool,
     prev_distance: float | None = None,
+    episode_elapsed_time: float | None = None,
     config: RewardConfig = DEFAULT_REWARD_CONFIG,
 ) -> float:
     obstacle_min_range = state[-2]
@@ -67,7 +70,8 @@ def compute_reward(
     )
 
     if arrive:
-        reward += config.reward_arrive_bonus
+        time_reward_weight = calc_time_reward_weight(episode_elapsed_time, config)
+        reward += config.reward_arrive_bonus * time_reward_weight
     elif done:
         reward += config.reward_collision_penalty
 
@@ -138,6 +142,24 @@ def calc_speed_reward(
         return max(0.0, normalized_speed)
 
     return -abs(normalized_speed)
+
+
+def calc_time_reward_weight(
+    episode_elapsed_time: float | None,
+    config: RewardConfig = DEFAULT_REWARD_CONFIG,
+) -> float:
+    if episode_elapsed_time is None:
+        return 1.0
+
+    if config.max_episode_time <= 0:
+        return 1.0
+
+    progress = episode_elapsed_time / config.max_episode_time
+    progress = max(0.0, min(1.0, progress))
+
+    return config.min_arrive_time_weight + (
+        1.0 - config.min_arrive_time_weight
+    ) * ((1.0 - progress) ** 2)
 
 
 def calc_heading_reward(
