@@ -342,12 +342,27 @@ class PPONav:
         # 终止奖励/惩罚
         if self.arrive:
             LogUtil.info("到达目标!")
-            reward += REWARD_ARRIVE_BONUS
+
+            # 计算自此轮训练开始的时间
+            episode_elapsed_time = time.time() - self.episode_start_time
+            # 时间奖励权重
+            time_reward_weight = self._calc_time_reward_weight(episode_elapsed_time)
+
+            reward += REWARD_ARRIVE_BONUS * time_reward_weight
         elif self.done:
             LogUtil.info("发生碰撞!")
             reward += REWARD_COLLISION_PENALTY
 
         return reward
+
+    @staticmethod
+    def _calc_time_reward_weight(episode_elapsed_time: float) -> float:
+        """计算时间权重。时间等于 MAX_EPISODE_TIME 时最小，为 0.0；等于 0 时最大，为 1.0。"""
+        diff = MAX_EPISODE_TIME - episode_elapsed_time
+        if MAX_EPISODE_TIME == 0:
+            return 0.0
+        normalized_diff = diff / MAX_EPISODE_TIME
+        return math.sqrt(normalized_diff) if 0 <= normalized_diff <= 1 else 0.0
 
     @staticmethod
     def _calc_distance_reward(current_distance: float, max_distance: float) -> float:
