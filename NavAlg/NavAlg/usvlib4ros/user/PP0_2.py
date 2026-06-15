@@ -146,7 +146,7 @@ class ActorCritic(nn.Module):
         Returns:
             log_prob: 在当前策略下,该状态-动作对的对数概率
             state_value: Critic 网络给出的状态价值 V(s)
-            entropy: 策略分布的熵,用于鼓励探索
+                : 策略分布的熵,用于鼓励探索
         """
         state = self._sanitize_tensor(state.to(device))
 

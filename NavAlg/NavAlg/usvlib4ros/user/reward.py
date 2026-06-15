@@ -17,9 +17,11 @@ class RewardConfig:
     n_actions: int = 1
     speed_scale: float = 100.0
     apf_attractive_gain: float = 1.0
-    apf_repulsive_gain: float = 8.0
+    apf_repulsive_gain: float = 1.0
     apf_obstacle_influence_range: float = 3.0
     apf_heading_repulsive_weight: float = 1.0
+
+    
 
 
 DEFAULT_REWARD_CONFIG = RewardConfig()
@@ -32,6 +34,10 @@ class RewardBreakdown:
     obstacle_reward: float
     total_reward: float
 
+    distance_raw: float
+    heading_raw: float
+    obstacle_raw: float
+
 
 def compute_reward(
     state: list,
@@ -41,6 +47,8 @@ def compute_reward(
     arrive: bool,
     done: bool,
     prev_distance: float | None = None,
+    heading_world: float | None = None,
+    target_heading_world: float | None = None,
     config: RewardConfig = DEFAULT_REWARD_CONFIG,
 ) -> float:
     return compute_reward_breakdown(
@@ -51,6 +59,8 @@ def compute_reward(
         arrive=arrive,
         done=done,
         prev_distance=prev_distance,
+        heading_world=heading_world,
+        target_heading_world=target_heading_world,
         config=config,
     ).total_reward
 
@@ -63,6 +73,8 @@ def compute_reward_breakdown(
     arrive: bool,
     done: bool,
     prev_distance: float | None = None,
+    heading_world: float | None = None,
+    target_heading_world: float | None = None,
     config: RewardConfig = DEFAULT_REWARD_CONFIG,
 ) -> RewardBreakdown:
     obstacle_min_range = state[-2]
@@ -78,6 +90,8 @@ def compute_reward_breakdown(
         max_distance=max_distance,
         obstacle_min_range=obstacle_min_range,
         obstacle_angle=obstacle_angle,
+        heading_world=heading_world,
+        target_heading_world=target_heading_world,
         config=config,
     )
 
@@ -101,6 +115,9 @@ def compute_reward_breakdown(
         heading_reward=heading_reward,
         obstacle_reward=obstacle_reward,
         total_reward=reward,
+        distance_raw=distance_reward_raw,
+        heading_raw=heading_reward_raw,
+        obstacle_raw=obstacle_reward_raw,
     )
 
 
@@ -189,6 +206,8 @@ def calc_apf_heading_reward(
     max_distance: float,
     obstacle_min_range: float,
     obstacle_angle: float,
+    heading_world: float | None,
+    target_heading_world: float | None,
     config: RewardConfig = DEFAULT_REWARD_CONFIG,
 ) -> float:
     distance_rate = 2 ** (current_distance / max_distance) if max_distance > 0 else 1.0
@@ -208,6 +227,8 @@ def calc_apf_heading_reward(
         current_distance=current_distance,
         obstacle_min_range=obstacle_min_range,
         obstacle_angle=obstacle_angle,
+        heading_world=heading_world,
+        target_heading_world=target_heading_world,
         config=config,
     )
     predicted_heading_diff = _normalize_signed_angle_diff(
@@ -222,28 +243,45 @@ def calc_apf_heading_diff(
     current_distance: float,
     obstacle_min_range: float,
     obstacle_angle: float,
+    heading_world: float | None,
+    target_heading_world: float | None,
     config: RewardConfig = DEFAULT_REWARD_CONFIG,
 ) -> float:
-    target_rad = math.radians(angle_diff)
+    heading_world = 0.0 if heading_world is None else heading_world
+    if target_heading_world is None:
+        target_heading_world = heading_world + angle_diff
+
+    # ---------- 引力矢量（与论文公式一致） ----------
+    target_rad = math.radians(target_heading_world)
     attractive_strength = config.apf_attractive_gain * max(float(current_distance), 0.0)
     attractive_x = attractive_strength * math.cos(target_rad)
     attractive_y = attractive_strength * math.sin(target_rad)
 
+    # ---------- 斥力矢量（论文梯度公式，而非势能） ----------
     repulsive_x = 0.0
     repulsive_y = 0.0
-    potential = calc_repulsive_potential(obstacle_min_range, config)
-    if potential > 0.0:
+    rho = max(float(obstacle_min_range), 1e-3)
+    rho_0 = config.apf_obstacle_influence_range
+    if rho < rho_0:
+        # 斥力大小：k * (1/rho - 1/rho_0) * (1/rho^2)
+        force_magnitude = config.apf_repulsive_gain * (1.0 / rho - 1.0 / rho_0) / (rho * rho)
+        # 障碍物相对角度（沿用原有映射：0°→正前方？实际代码中 obstacle_angle*2-90）
         obstacle_relative_deg = float(obstacle_angle) * 2.0 - 90.0
-        obstacle_rad = math.radians(obstacle_relative_deg)
-        repulsive_strength = potential * config.apf_heading_repulsive_weight
+        obstacle_world_deg = heading_world + obstacle_relative_deg
+        obstacle_rad = math.radians(obstacle_world_deg)
+        # 斥力方向：从障碍物指向船舶（即与障碍物方向相反）
+        # 保留原代码的负号，使船舶远离障碍物
+        repulsive_strength = force_magnitude * config.apf_heading_repulsive_weight
         repulsive_x = -repulsive_strength * math.cos(obstacle_rad)
         repulsive_y = -repulsive_strength * math.sin(obstacle_rad)
 
+    # ---------- 合力 ----------
     apf_x = attractive_x + repulsive_x
     apf_y = attractive_y + repulsive_y
     if abs(apf_x) < 1e-6 and abs(apf_y) < 1e-6:
         return _normalize_signed_angle_diff(angle_diff)
-    return _normalize_signed_angle_diff(math.degrees(math.atan2(apf_y, apf_x)))
+    apf_heading_world = math.degrees(math.atan2(apf_y, apf_x))
+    return _normalize_signed_angle_diff(apf_heading_world - heading_world)
 
 
 def _normalize_signed_angle_diff(angle: float) -> float:
