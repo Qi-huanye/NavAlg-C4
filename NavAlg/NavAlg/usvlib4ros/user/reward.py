@@ -10,6 +10,13 @@ class RewardConfig:
     reward_weight_distance: float = 0.6
     reward_weight_obstacle: float = 0.2
     reward_weight_heading: float = 0.2
+    reward_weight_speed: float = 0.2
+    progress_scale: float = 10.0
+    obstacle_safe_range: float = 3.0
+    obstacle_penalty_scale: float = 10.0
+    step_penalty: float = -0.01
+    max_episode_time: float = 300.0
+    min_arrive_time_weight: float = 0.5
     target_slow_range: float = 3.0
     angular_velocity_max: float = 100
     control_dt: float = 0.1
@@ -49,6 +56,7 @@ def compute_reward(
     prev_distance: float | None = None,
     heading_world: float | None = None,
     target_heading_world: float | None = None,
+    episode_elapsed_time: float | None = None,
     config: RewardConfig = DEFAULT_REWARD_CONFIG,
 ) -> float:
     return compute_reward_breakdown(
@@ -82,7 +90,12 @@ def compute_reward_breakdown(
     current_distance = state[-3]
     distance_reward_raw = calc_progress_reward(prev_distance, current_distance)
     if prev_distance is None:
-        distance_reward_raw = calc_distance_reward(current_distance, max_distance)
+        distance_reward_raw = calc_distance_reward(
+        current_distance=current_distance,
+        prev_distance=prev_distance,
+        max_distance=max_distance,
+        config=config,
+    )
     heading_reward_raw = calc_apf_heading_reward(
         action=action,
         angle_diff=angle_diff if angle_diff is not None else state[-4],
@@ -102,11 +115,14 @@ def compute_reward_breakdown(
     distance_reward = distance_reward_raw * config.reward_weight_distance
     obstacle_reward = obstacle_reward_raw * config.reward_weight_obstacle
     heading_reward = heading_reward_raw * config.reward_weight_heading
+        + speed_reward * config.reward_weight_speed
+        + config.step_penalty
 
     reward = distance_reward + obstacle_reward + heading_reward
 
     if arrive:
-        reward += config.reward_arrive_bonus
+        time_reward_weight = calc_time_reward_weight(episode_elapsed_time, config)
+        reward += config.reward_arrive_bonus * time_reward_weight
     elif done:
         reward += config.reward_collision_penalty
 
@@ -142,11 +158,67 @@ def _split_action(action: int | float | list | tuple) -> tuple[float, float]:
     return float(action), 0.0
 
 
-def calc_distance_reward(current_distance: float, max_distance: float) -> float:
-    if current_distance <= 1 or max_distance <= 0:
+def calc_distance_reward(
+    current_distance: float,
+    prev_distance: float | None,
+    max_distance: float,
+    config: RewardConfig = DEFAULT_REWARD_CONFIG,
+) -> float:
+    if current_distance <= 1:
         return 0.0
+
+    if prev_distance is not None:
+        return (prev_distance - current_distance) * config.progress_scale
+
+    if max_distance <= 0:
+        return 0.0
+
     reward = 1 - (current_distance / max_distance)
     return reward * 2 if reward < 0 else reward * 5
+
+
+def calc_obstacle_reward(
+    obstacle_min_range: float,
+    config: RewardConfig = DEFAULT_REWARD_CONFIG,
+) -> float:
+    if obstacle_min_range >= config.obstacle_safe_range:
+        return 0.0
+
+    danger_ratio = (config.obstacle_safe_range - obstacle_min_range) / config.obstacle_safe_range
+    return -(danger_ratio ** 2) * config.obstacle_penalty_scale
+
+
+def calc_speed_reward(
+    action: int | float | list | tuple,
+    angle_diff: float,
+    obstacle_min_range: float,
+    config: RewardConfig = DEFAULT_REWARD_CONFIG,
+) -> float:
+    _, speed_action = _split_action(action)
+    normalized_speed = max(-1.0, min(1.0, speed_action))
+
+    if abs(angle_diff) < 30 and obstacle_min_range >= config.obstacle_safe_range:
+        return max(0.0, normalized_speed)
+
+    return -abs(normalized_speed)
+
+
+def calc_time_reward_weight(
+    episode_elapsed_time: float | None,
+    config: RewardConfig = DEFAULT_REWARD_CONFIG,
+) -> float:
+    if episode_elapsed_time is None:
+        return 1.0
+
+    if config.max_episode_time <= 0:
+        return 1.0
+
+    progress = episode_elapsed_time / config.max_episode_time
+    progress = max(0.0, min(1.0, progress))
+
+    return config.min_arrive_time_weight + (
+        1.0 - config.min_arrive_time_weight
+    ) * ((1.0 - progress) ** 2)
 
 
 def calc_progress_reward(prev_distance: float | None, current_distance: float) -> float:
