@@ -28,9 +28,6 @@ class RewardConfig:
     apf_obstacle_influence_range: float = 3.0
     apf_heading_repulsive_weight: float = 1.0
 
-    
-
-
 DEFAULT_REWARD_CONFIG = RewardConfig()
 
 
@@ -39,11 +36,13 @@ class RewardBreakdown:
     distance_reward: float
     heading_reward: float
     obstacle_reward: float
+    speed_reward: float
     total_reward: float
 
     distance_raw: float
     heading_raw: float
     obstacle_raw: float
+    speed_raw: float
 
 
 def compute_reward(
@@ -69,6 +68,7 @@ def compute_reward(
         prev_distance=prev_distance,
         heading_world=heading_world,
         target_heading_world=target_heading_world,
+        episode_elapsed_time=episode_elapsed_time,
         config=config,
     ).total_reward
 
@@ -83,6 +83,7 @@ def compute_reward_breakdown(
     prev_distance: float | None = None,
     heading_world: float | None = None,
     target_heading_world: float | None = None,
+    episode_elapsed_time: float | None = None,
     config: RewardConfig = DEFAULT_REWARD_CONFIG,
 ) -> RewardBreakdown:
     obstacle_min_range = state[-2]
@@ -112,13 +113,25 @@ def compute_reward_breakdown(
     if current_distance < config.target_slow_range:
         obstacle_reward_raw = config.reward_near_target_bonus
 
+    speed_reward_raw = calc_speed_reward(
+        action=action,
+        angle_diff=angle_diff if angle_diff is not None else state[-4],
+        obstacle_min_range=obstacle_min_range,
+        config=config,
+    )
+
     distance_reward = distance_reward_raw * config.reward_weight_distance
     obstacle_reward = obstacle_reward_raw * config.reward_weight_obstacle
     heading_reward = heading_reward_raw * config.reward_weight_heading
-        + speed_reward * config.reward_weight_speed
-        + config.step_penalty
+    speed_reward = speed_reward_raw * config.reward_weight_speed
 
-    reward = distance_reward + obstacle_reward + heading_reward
+    reward = (
+        distance_reward
+        + obstacle_reward
+        + heading_reward
+        + speed_reward
+        + config.step_penalty
+    )
 
     if arrive:
         time_reward_weight = calc_time_reward_weight(episode_elapsed_time, config)
@@ -130,10 +143,12 @@ def compute_reward_breakdown(
         distance_reward=distance_reward,
         heading_reward=heading_reward,
         obstacle_reward=obstacle_reward,
+        speed_reward=speed_reward,
         total_reward=reward,
         distance_raw=distance_reward_raw,
         heading_raw=heading_reward_raw,
         obstacle_raw=obstacle_reward_raw,
+        speed_raw=speed_reward_raw,
     )
 
 
