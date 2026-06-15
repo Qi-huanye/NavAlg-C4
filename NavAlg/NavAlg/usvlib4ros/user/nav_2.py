@@ -3,6 +3,7 @@ import time
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -12,6 +13,7 @@ from usvlib4ros.navigation.route_plan_service import RoutePlanService
 from usvlib4ros.msg.global_data import GlobalData, DictToObject, Point, Constants
 from usvlib4ros.msg.parameter import Parameter
 from usvlib4ros.usvRosUtil import LogUtil
+from usvlib4ros.user.episode_logging import EpisodeDataLogger
 from usvlib4ros.user.PP0_2 import PPO, device
 from usvlib4ros.user.reward import RewardConfig, compute_reward
 from usvlib4ros.user.tensorboard_logging import TensorBoardMetricsWriter, build_tensorboard_log_dir
@@ -33,6 +35,7 @@ MAX_STEP_PER_EPISODE = 3000   # 每轮最大步数
 MAX_EPISODE_TIME = 300  # 每轮最大时间(秒)
 UPDATE_INTERVAL = 2000  # PPO更新间隔(步数)
 CHECKPOINT_INTERVAL = 100  # 模型保存间隔(轮数)
+RESET_SETTLE_DELAY = 3.0  # 每轮复位后等待仿真刷新(秒)
 
 # ==================== 导航常量 ====================
 LASER_MAX_RANGE = 5.0        # 激光雷达有效最大距离(m)
@@ -87,6 +90,9 @@ class PPONav:
         self.current_episode_step = 0
         self.tb_log_dir = build_tensorboard_log_dir(Path.cwd() / "runs")
         self.tb_writer = TensorBoardMetricsWriter(log_dir=self.tb_log_dir)
+        self.enable_episode_logging = False
+        self.episode_log_dir = Path.cwd() / "logs"
+        self.episode_logger = None
 
         # PPO智能体
         self.ppo_agent = PPO(
@@ -142,68 +148,74 @@ class PPONav:
                         LogUtil.info("停止训练")
                         break
 
-                    LogUtil.info(f"第 {epoch} 轮训练开始")
+                    try:
+                        LogUtil.info(f"第 {epoch} 轮训练开始")
+                        self._start_episode_logging(epoch)
 
-                    # 复位Unity环境
-                    self.ros_ctrl.reset_unity()
-                    time.sleep(0.1)
-                    while self.global_data.device_data.reset_status != 2:
+                        # 复位Unity环境
+                        self.ros_ctrl.reset_unity()
                         time.sleep(0.1)
+                        while self.global_data.device_data.reset_status != 2:
+                            time.sleep(0.1)
 
-                    self.ros_ctrl.set_auto_work()
+                        time.sleep(RESET_SETTLE_DELAY)
+                        self.ros_ctrl.set_auto_work()
 
-                    # 加载航线
-                    self.route = self.ros_ctrl.getRoute()
-                    if len(self.route.points) == 0:
-                        LogUtil.error("航线数据为空")
-                        time.sleep(0.1)
-                        continue
+                        # 加载航线
+                        self.route = self.ros_ctrl.getRoute()
+                        if len(self.route.points) == 0:
+                            LogUtil.error("航线数据为空")
+                            time.sleep(0.1)
+                            continue
 
-                    LogUtil.info(f"航线加载完成: {self.route}")
+                        LogUtil.info(f"航线加载完成: {self.route}")
 
-                    # 初始化本轮状态
-                    self._reset_episode_state()
-                    self.global_data.route = self.route
-                    self.__reloadNavigationRoute(self.route)
+                        # 初始化本轮状态
+                        self._reset_episode_state()
+                        self.global_data.route = self.route
+                        self.__reloadNavigationRoute(self.route)
 
-                    # 本轮导航循环
-                    self.episode_start_time = time.time()
-                    for step in range(MAX_STEP_PER_EPISODE):
-                        self.current_episode_step = step + 1
-                        if self.global_data.device_data.task_status == 0:
-                            LogUtil.info(f"步骤 {step} 停止训练")
-                            break
+                        # 本轮导航循环
+                        self.episode_start_time = time.time()
+                        for step in range(MAX_STEP_PER_EPISODE):
+                            self.current_episode_step = step + 1
+                            if self.global_data.device_data.task_status == 0:
+                                LogUtil.info(f"步骤 {step} 停止训练")
+                                break
 
-                        if (time.time() - self.episode_start_time) > MAX_EPISODE_TIME:
-                            LogUtil.info("本轮超时,提前结束")
-                            break
+                            if (time.time() - self.episode_start_time) > MAX_EPISODE_TIME:
+                                LogUtil.info("本轮超时,提前结束")
+                                break
 
-                        self.done = self.navigationHandler(self.next_state, epoch, step)
+                            self.done = self.navigationHandler(self.next_state, epoch, step)
 
-                        # 定期更新PPO
-                        if step > 0 and step % UPDATE_INTERVAL == 0:
-                            self.ppo_agent.update()
+                            # 定期更新PPO
+                            if step > 0 and step % UPDATE_INTERVAL == 0:
+                                self.ppo_agent.update()
 
-                        self.setMonitorParameterValue()
+                            self.setMonitorParameterValue()
 
-                        if self.done or self.arrive:
+                            if self.done or self.arrive:
+                                self._log_episode_metrics(epoch)
+                                break
+
+                            time.sleep(0.1)
+
+                        if not self.done and not self.arrive and self.current_episode_step > 0:
                             self._log_episode_metrics(epoch)
-                            break
 
-                        time.sleep(0.1)
-
-                    if not self.done and not self.arrive and self.current_episode_step > 0:
-                        self._log_episode_metrics(epoch)
-
-                    # 定期保存模型
-                    if epoch % CHECKPOINT_INTERVAL == 0:
-                        checkpoint_path = f"./PPO_ship_obstacle_{epoch}.pth"
-                        self.ppo_agent.save(checkpoint_path)
-                        LogUtil.info(f"模型已保存: {checkpoint_path}")
+                        # 定期保存模型
+                        if epoch % CHECKPOINT_INTERVAL == 0:
+                            checkpoint_path = f"./PPO_ship_obstacle_{epoch}.pth"
+                            self.ppo_agent.save(checkpoint_path)
+                            LogUtil.info(f"模型已保存: {checkpoint_path}")
+                    finally:
+                        self._close_episode_logging()
 
             except Exception as e:
                 LogUtil.error(e)
             finally:
+                self._close_episode_logging()
                 self._close_tensorboard_writer()
                 time.sleep(2)
 
@@ -523,6 +535,8 @@ class PPONav:
             if laser_scan is None:
                 return False
 
+            self._log_episode_snapshot(pose_info, nav_context, laser_scan)
+
             # 4. 执行PPO决策循环
             done = self._ppo_decision_loop(state, episode, step, laser_scan, nav_context)
 
@@ -597,6 +611,84 @@ class PPONav:
             return None
         self.last_laser_scan = laser_scan
         return laser_scan
+
+    def _log_episode_snapshot(self, pose_info: tuple, nav_context: dict, laser_scan: Any):
+        if not self.enable_episode_logging or self.episode_logger is None:
+            return
+        obstacle = self._build_obstacle_snapshot(laser_scan, pose_info[4])
+        target = self._point_to_dict(self.destPoint)
+        ship = {
+            "lng": pose_info[2],
+            "lat": pose_info[3],
+        }
+        laser = list(getattr(laser_scan, "ranges", []) or [])
+        self.episode_logger.log_snapshot(
+            obstacle=obstacle,
+            target=target,
+            ship=ship,
+            laser=laser,
+        )
+
+    def _start_episode_logging(self, episode: int):
+        if not self.enable_episode_logging:
+            return
+        if self.episode_logger is None:
+            self.episode_logger = EpisodeDataLogger(self.episode_log_dir)
+        self.episode_logger.start_episode(episode)
+
+    def _close_episode_logging(self):
+        if self.episode_logger is None:
+            return
+        self.episode_logger.close()
+
+    def _build_obstacle_snapshot(self, laser_scan: Any, heading: float) -> dict:
+        ranges = list(getattr(laser_scan, "ranges", []) or [])
+        if not ranges:
+            return {"lng": None, "lat": None, "distance": None, "angle": None}
+
+        valid_points = []
+        for index, value in enumerate(ranges):
+            if value in (None, float("Inf")):
+                continue
+            if isinstance(value, float) and np.isnan(value):
+                continue
+            if value <= 0 or value > LASER_MAX_RANGE:
+                continue
+            valid_points.append((index, float(value)))
+
+        if not valid_points:
+            return {"lng": None, "lat": None, "distance": None, "angle": None}
+
+        min_index, min_distance = min(valid_points, key=lambda item: item[1])
+        heading_rad = math.radians(heading)
+        angle_increment = self._safe_float(getattr(laser_scan, "angle_increment", 0.0))
+        angle_min = self._safe_float(getattr(laser_scan, "angle_min", 0.0))
+        relative_angle = angle_min + min_index * angle_increment
+        world_angle = heading_rad + relative_angle
+        relative_angle_deg = math.degrees(relative_angle)
+
+        return {
+            "lng": round(min_distance * math.cos(world_angle), 6),
+            "lat": round(min_distance * math.sin(world_angle), 6),
+            "distance": round(min_distance, 6),
+            "angle": round(relative_angle_deg, 6),
+        }
+
+    @staticmethod
+    def _point_to_dict(point: Any) -> dict:
+        if point is None:
+            return {"lng": None, "lat": None}
+        return {
+            "lng": getattr(point, "lng", None),
+            "lat": getattr(point, "lat", None),
+        }
+
+    @staticmethod
+    def _safe_float(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
 
     def _ppo_decision_loop(self, state, episode: int, step: int,
                            laser_scan, nav_context: dict) -> bool:
