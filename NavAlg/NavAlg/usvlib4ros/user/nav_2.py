@@ -405,7 +405,6 @@ class PPONav:
             prev_distance=prev_distance,
             heading_world=heading,
             target_heading_world=degreeAship,
-            prev_distance=current_distance,
             episode_elapsed_time=time.time() - self.episode_start_time,
             config=self.reward_config,
         )
