@@ -1,0 +1,519 @@
+import csv
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception:  # pragma: no cover
+    plt = None
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:  # pragma: no cover
+    SummaryWriter = None
+
+
+@dataclass
+class EpisodeMetrics:
+    episode: int
+    episode_return: float
+    steps: int
+    episode_time_sec: float
+    arrived: bool
+    collided: bool
+    timeout: bool
+    actor_loss: float | None
+    critic_loss: float | None
+    total_loss: float | None
+    entropy: float | None
+    auc_return: float
+    first_arrive_episode: int | None
+
+
+class TrainingLogger:
+    """轻量训练日志器，同时记录 TensorBoard 和 CSV。"""
+
+    def __init__(self, root_dir: str | Path = "Results", summary_interval: int = 50):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_dir = Path(root_dir) / f"ppo_nav_{timestamp}"
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.checkpoint_dir = self.run_dir / "checkpoints"
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.plot_dir = self.run_dir / "plots"
+        self.plot_dir.mkdir(parents=True, exist_ok=True)
+
+        self.summary_interval = max(1, int(summary_interval))
+        self.episode_csv_path = self.run_dir / "episode_metrics.csv"
+        self.summary_csv_path = self.run_dir / "summary_metrics.csv"
+        self.update_csv_path = self.run_dir / "ppo_update_metrics.csv"
+
+        self.writer = SummaryWriter(log_dir=str(self.run_dir)) if SummaryWriter else None
+
+        self.total_episodes = 0
+        self.arrive_count = 0
+        self.collision_count = 0
+        self.total_episode_time = 0.0
+        self.total_steps = 0
+        self.return_auc = 0.0
+        self.first_arrive_episode = None
+        self._window: list[EpisodeMetrics] = []
+        self._episode_rows: list[dict[str, Any]] = []
+        self._summary_rows: list[dict[str, Any]] = []
+        self._update_rows: list[dict[str, Any]] = []
+
+        self._init_csv_files()
+
+    def _init_csv_files(self):
+        self._write_csv_header(
+            self.episode_csv_path,
+            [
+                "episode",
+                "episode_return",
+                "steps",
+                "episode_time_sec",
+                "arrived",
+                "collided",
+                "timeout",
+                "actor_loss",
+                "critic_loss",
+                "total_loss",
+                "entropy",
+                "auc_return",
+                "first_arrive_episode",
+                "success_rate_total",
+                "collision_rate_total",
+                "avg_episode_time_total",
+                "avg_steps_total",
+            ],
+        )
+        self._write_csv_header(
+            self.summary_csv_path,
+            [
+                "episode_end",
+                "window_size",
+                "success_rate_window",
+                "collision_rate_window",
+                "avg_episode_time_window",
+                "avg_steps_window",
+                "avg_return_window",
+                "success_rate_total",
+                "collision_rate_total",
+                "avg_episode_time_total",
+                "avg_steps_total",
+                "auc_return",
+                "first_arrive_episode",
+            ],
+        )
+        self._write_csv_header(
+            self.update_csv_path,
+            [
+                "update_step",
+                "buffer_size",
+                "actor_loss",
+                "critic_loss",
+                "total_loss",
+                "entropy",
+            ],
+        )
+
+    @staticmethod
+    def _write_csv_header(path: Path, header: list[str]):
+        with path.open("w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(header)
+
+    @staticmethod
+    def _append_csv_row(path: Path, row: list[Any]):
+        with path.open("a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(row)
+
+    def log_update(self, global_step: int, update_metrics: dict[str, float] | None):
+        if not update_metrics:
+            return
+
+        row_dict = {
+            "update_step": global_step,
+            "buffer_size": update_metrics.get("buffer_size"),
+            "actor_loss": update_metrics.get("actor_loss"),
+            "critic_loss": update_metrics.get("critic_loss"),
+            "total_loss": update_metrics.get("total_loss"),
+            "entropy": update_metrics.get("entropy"),
+        }
+        row = [
+            row_dict["update_step"],
+            row_dict["buffer_size"],
+            row_dict["actor_loss"],
+            row_dict["critic_loss"],
+            row_dict["total_loss"],
+            row_dict["entropy"],
+        ]
+        self._update_rows.append(row_dict)
+        self._append_csv_row(self.update_csv_path, row)
+
+        if self.writer:
+            self.writer.add_scalar("loss/actor", update_metrics["actor_loss"], global_step)
+            self.writer.add_scalar("loss/critic", update_metrics["critic_loss"], global_step)
+            self.writer.add_scalar("loss/total", update_metrics["total_loss"], global_step)
+            self.writer.add_scalar("policy/entropy", update_metrics["entropy"], global_step)
+
+        self._plot_update_metrics()
+
+    def log_episode(
+        self,
+        episode: int,
+        episode_return: float,
+        steps: int,
+        episode_time_sec: float,
+        arrived: bool,
+        collided: bool,
+        timeout: bool,
+        last_update_metrics: dict[str, float] | None,
+    ) -> EpisodeMetrics:
+        self.total_episodes += 1
+        self.arrive_count += int(arrived)
+        self.collision_count += int(collided)
+        self.total_episode_time += episode_time_sec
+        self.total_steps += steps
+        self.return_auc += episode_return
+
+        if arrived and self.first_arrive_episode is None:
+            self.first_arrive_episode = episode
+
+        metrics = EpisodeMetrics(
+            episode=episode,
+            episode_return=episode_return,
+            steps=steps,
+            episode_time_sec=episode_time_sec,
+            arrived=arrived,
+            collided=collided,
+            timeout=timeout,
+            actor_loss=self._metric_value(last_update_metrics, "actor_loss"),
+            critic_loss=self._metric_value(last_update_metrics, "critic_loss"),
+            total_loss=self._metric_value(last_update_metrics, "total_loss"),
+            entropy=self._metric_value(last_update_metrics, "entropy"),
+            auc_return=self.return_auc,
+            first_arrive_episode=self.first_arrive_episode,
+        )
+        self._window.append(metrics)
+
+        total_success_rate = self.arrive_count / self.total_episodes
+        total_collision_rate = self.collision_count / self.total_episodes
+        total_avg_time = self.total_episode_time / self.total_episodes
+        total_avg_steps = self.total_steps / self.total_episodes
+        row_dict = {
+            "episode": metrics.episode,
+            "episode_return": metrics.episode_return,
+            "steps": metrics.steps,
+            "episode_time_sec": metrics.episode_time_sec,
+            "arrived": int(metrics.arrived),
+            "collided": int(metrics.collided),
+            "timeout": int(metrics.timeout),
+            "actor_loss": metrics.actor_loss,
+            "critic_loss": metrics.critic_loss,
+            "total_loss": metrics.total_loss,
+            "entropy": metrics.entropy,
+            "auc_return": metrics.auc_return,
+            "first_arrive_episode": metrics.first_arrive_episode,
+            "success_rate_total": total_success_rate,
+            "collision_rate_total": total_collision_rate,
+            "avg_episode_time_total": total_avg_time,
+            "avg_steps_total": total_avg_steps,
+        }
+        self._episode_rows.append(row_dict)
+
+        self._append_csv_row(
+            self.episode_csv_path,
+            [
+                row_dict["episode"],
+                row_dict["episode_return"],
+                row_dict["steps"],
+                row_dict["episode_time_sec"],
+                row_dict["arrived"],
+                row_dict["collided"],
+                row_dict["timeout"],
+                row_dict["actor_loss"],
+                row_dict["critic_loss"],
+                row_dict["total_loss"],
+                row_dict["entropy"],
+                row_dict["auc_return"],
+                row_dict["first_arrive_episode"],
+                row_dict["success_rate_total"],
+                row_dict["collision_rate_total"],
+                row_dict["avg_episode_time_total"],
+                row_dict["avg_steps_total"],
+            ],
+        )
+
+        if self.writer:
+            self.writer.add_scalar("episode/return", episode_return, episode)
+            self.writer.add_scalar("episode/steps", steps, episode)
+            self.writer.add_scalar("episode/time_sec", episode_time_sec, episode)
+            self.writer.add_scalar("episode/success", int(arrived), episode)
+            self.writer.add_scalar("episode/collision", int(collided), episode)
+            self.writer.add_scalar("metrics/auc_return", self.return_auc, episode)
+            self.writer.add_scalar("metrics/success_rate_total", total_success_rate, episode)
+            self.writer.add_scalar("metrics/collision_rate_total", total_collision_rate, episode)
+            self.writer.add_scalar("metrics/avg_episode_time_total", total_avg_time, episode)
+            self.writer.add_scalar("metrics/avg_steps_total", total_avg_steps, episode)
+
+        if len(self._window) >= self.summary_interval:
+            self._flush_window_summary(episode)
+
+        self._plot_episode_metrics()
+        return metrics
+
+    def _flush_window_summary(self, episode: int):
+        window = self._window[:]
+        self._window.clear()
+        if not window:
+            return
+
+        window_size = len(window)
+        success_rate_window = sum(int(x.arrived) for x in window) / window_size
+        collision_rate_window = sum(int(x.collided) for x in window) / window_size
+        avg_time_window = sum(x.episode_time_sec for x in window) / window_size
+        avg_steps_window = sum(x.steps for x in window) / window_size
+        avg_return_window = sum(x.episode_return for x in window) / window_size
+
+        total_success_rate = self.arrive_count / self.total_episodes
+        total_collision_rate = self.collision_count / self.total_episodes
+        total_avg_time = self.total_episode_time / self.total_episodes
+        total_avg_steps = self.total_steps / self.total_episodes
+        row_dict = {
+            "episode_end": episode,
+            "window_size": window_size,
+            "success_rate_window": success_rate_window,
+            "collision_rate_window": collision_rate_window,
+            "avg_episode_time_window": avg_time_window,
+            "avg_steps_window": avg_steps_window,
+            "avg_return_window": avg_return_window,
+            "success_rate_total": total_success_rate,
+            "collision_rate_total": total_collision_rate,
+            "avg_episode_time_total": total_avg_time,
+            "avg_steps_total": total_avg_steps,
+            "auc_return": self.return_auc,
+            "first_arrive_episode": self.first_arrive_episode,
+        }
+        self._summary_rows.append(row_dict)
+
+        self._append_csv_row(
+            self.summary_csv_path,
+            [
+                row_dict["episode_end"],
+                row_dict["window_size"],
+                row_dict["success_rate_window"],
+                row_dict["collision_rate_window"],
+                row_dict["avg_episode_time_window"],
+                row_dict["avg_steps_window"],
+                row_dict["avg_return_window"],
+                row_dict["success_rate_total"],
+                row_dict["collision_rate_total"],
+                row_dict["avg_episode_time_total"],
+                row_dict["avg_steps_total"],
+                row_dict["auc_return"],
+                row_dict["first_arrive_episode"],
+            ],
+        )
+
+        if self.writer:
+            self.writer.add_scalar("window50/success_rate", success_rate_window, episode)
+            self.writer.add_scalar("window50/collision_rate", collision_rate_window, episode)
+            self.writer.add_scalar("window50/avg_episode_time", avg_time_window, episode)
+            self.writer.add_scalar("window50/avg_steps", avg_steps_window, episode)
+            self.writer.add_scalar("window50/avg_return", avg_return_window, episode)
+
+        self._plot_summary_metrics()
+
+    def close(self):
+        if self._window:
+            last_episode = self._window[-1].episode
+            self._flush_window_summary(last_episode)
+        self._plot_all()
+        if self.writer:
+            self.writer.flush()
+            self.writer.close()
+
+    @staticmethod
+    def _metric_value(metrics: dict[str, float] | None, key: str) -> float | None:
+        if not metrics:
+            return None
+        return metrics.get(key)
+
+    def _plot_all(self):
+        self._plot_episode_metrics()
+        self._plot_update_metrics()
+        self._plot_summary_metrics()
+
+    def _plot_episode_metrics(self):
+        if plt is None or not self._episode_rows:
+            return
+
+        episodes = [row["episode"] for row in self._episode_rows]
+        self._save_line_plot(
+            self.plot_dir / "episode_return.png",
+            episodes,
+            [row["episode_return"] for row in self._episode_rows],
+            "Episode Return",
+            "Episode",
+            "Return",
+        )
+        self._save_line_plot(
+            self.plot_dir / "episode_steps.png",
+            episodes,
+            [row["steps"] for row in self._episode_rows],
+            "Episode Steps",
+            "Episode",
+            "Steps",
+        )
+        self._save_line_plot(
+            self.plot_dir / "episode_time.png",
+            episodes,
+            [row["episode_time_sec"] for row in self._episode_rows],
+            "Episode Time",
+            "Episode",
+            "Seconds",
+        )
+        self._save_multi_line_plot(
+            self.plot_dir / "success_collision_total.png",
+            episodes,
+            [
+                ("Success Rate Total", [row["success_rate_total"] for row in self._episode_rows]),
+                ("Collision Rate Total", [row["collision_rate_total"] for row in self._episode_rows]),
+            ],
+            "Success / Collision Rate",
+            "Episode",
+            "Rate",
+        )
+        self._save_line_plot(
+            self.plot_dir / "auc_return.png",
+            episodes,
+            [row["auc_return"] for row in self._episode_rows],
+            "AUC Return",
+            "Episode",
+            "AUC",
+        )
+
+    def _plot_update_metrics(self):
+        if plt is None or not self._update_rows:
+            return
+
+        steps = [row["update_step"] for row in self._update_rows]
+        self._save_multi_line_plot(
+            self.plot_dir / "ppo_losses.png",
+            steps,
+            [
+                ("Actor Loss", [row["actor_loss"] for row in self._update_rows]),
+                ("Critic Loss", [row["critic_loss"] for row in self._update_rows]),
+                ("Total Loss", [row["total_loss"] for row in self._update_rows]),
+            ],
+            "PPO Loss Curves",
+            "Update Step",
+            "Loss",
+        )
+        self._save_line_plot(
+            self.plot_dir / "entropy.png",
+            steps,
+            [row["entropy"] for row in self._update_rows],
+            "Policy Entropy",
+            "Update Step",
+            "Entropy",
+        )
+        self._save_line_plot(
+            self.plot_dir / "buffer_size.png",
+            steps,
+            [row["buffer_size"] for row in self._update_rows],
+            "Buffer Size",
+            "Update Step",
+            "Samples",
+        )
+
+    def _plot_summary_metrics(self):
+        if plt is None or not self._summary_rows:
+            return
+
+        episodes = [row["episode_end"] for row in self._summary_rows]
+        self._save_multi_line_plot(
+            self.plot_dir / "window50_rates.png",
+            episodes,
+            [
+                ("Success Rate Window", [row["success_rate_window"] for row in self._summary_rows]),
+                ("Collision Rate Window", [row["collision_rate_window"] for row in self._summary_rows]),
+            ],
+            "Window Metrics",
+            "Episode",
+            "Rate",
+        )
+        self._save_multi_line_plot(
+            self.plot_dir / "window50_efficiency.png",
+            episodes,
+            [
+                ("Avg Return Window", [row["avg_return_window"] for row in self._summary_rows]),
+                ("Avg Steps Window", [row["avg_steps_window"] for row in self._summary_rows]),
+                ("Avg Time Window", [row["avg_episode_time_window"] for row in self._summary_rows]),
+            ],
+            "Window Efficiency",
+            "Episode",
+            "Value",
+        )
+
+    def _save_line_plot(
+        self,
+        path: Path,
+        x_values: list[float],
+        y_values: list[float | None],
+        title: str,
+        x_label: str,
+        y_label: str,
+    ):
+        series = [(x, y) for x, y in zip(x_values, y_values) if y is not None]
+        if not series:
+            return
+        xs = [x for x, _ in series]
+        ys = [y for _, y in series]
+
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        ax.plot(xs, ys, linewidth=1.8)
+        ax.set_title(title)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(y_label)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, dpi=160)
+        plt.close(fig)
+
+    def _save_multi_line_plot(
+        self,
+        path: Path,
+        x_values: list[float],
+        series_list: list[tuple[str, list[float | None]]],
+        title: str,
+        x_label: str,
+        y_label: str,
+    ):
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        has_data = False
+
+        for label, y_values in series_list:
+            series = [(x, y) for x, y in zip(x_values, y_values) if y is not None]
+            if not series:
+                continue
+            has_data = True
+            xs = [x for x, _ in series]
+            ys = [y for _, y in series]
+            ax.plot(xs, ys, linewidth=1.8, label=label)
+
+        if not has_data:
+            plt.close(fig)
+            return
+
+        ax.set_title(title)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(y_label)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(path, dpi=160)
+        plt.close(fig)

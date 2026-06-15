@@ -1,6 +1,7 @@
-import logging
+﻿import logging
 import torch
 import torch.nn as nn
+import math
 from torch.distributions import Categorical, MultivariateNormal
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,7 @@ class ActorCritic(nn.Module):
         if has_continuous_action_space:
             self.action_dim = action_dim
             # 初始化动作方差向量(对角矩阵的主对角线元素),并移至目标设备
+            self.log_std = nn.Parameter(torch.full((action_dim,),math.log(action_std_init)))
             self.action_var = torch.full((action_dim,), action_std_init * action_std_init).to(device)
 
         # ========== Actor 网络 ==========
@@ -120,8 +122,9 @@ class ActorCritic(nn.Module):
             # 连续动作空间:Actor 输出动作均值,使用对角协方差矩阵构建正态分布
             raw = self.actor(state)
             action_mean = self._get_action_mean(raw)
-            cov_mat = torch.diag(self.action_var).unsqueeze(dim=0)  # 协方差矩阵 (action_dim, action_dim)
-            dist = MultivariateNormal(action_mean, cov_mat)
+            std = torch.exp(self.log_std) # 标准差向量
+            scale_tril = torch.diag(std) # 更新协方差矩阵
+            dist = MultivariateNormal(action_mean, scale_tril=scale_tril)
 
         else:
             # 离散动作空间:Actor 输出概率分布,需限制数值范围避免极值
@@ -151,13 +154,15 @@ class ActorCritic(nn.Module):
         state = self._sanitize_tensor(state.to(device))
 
         if self.has_continuous_action_space:
-            raw = self.actor(state)
+            raw = self._sanitize_tensor(self.actor(state))
             action_mean = self._get_action_mean(raw)
+            action_mean = self._sanitize_tensor(action_mean)
             # 将固定方差扩展到与批量数据相同的形状
-            action_var = self.action_var.expand_as(action_mean)
-            # 构建对角协方差矩阵(批量形式)
-            cov_mat = torch.diag_embed(action_var).to(device)
-            dist = MultivariateNormal(action_mean, cov_mat)
+            std = torch.exp(self.log_std)                     # 标准差向量
+            # 扩展到批次维度：将 (action_dim,) 复制到 (batch, action_dim)
+            std_batch = std.unsqueeze(0).expand(action_mean.size(0), -1)
+            scale_tril = torch.diag_embed(std_batch)          # 批量对角矩阵
+            dist = MultivariateNormal(action_mean, scale_tril=scale_tril)
         else:
             action_probs = torch.clamp(self.actor(state), min=1e-6, max=1 - 1e-6)
             action_probs = self._sanitize_tensor(action_probs)
@@ -168,8 +173,10 @@ class ActorCritic(nn.Module):
     
     def _get_action_mean(self, raw_action):
         """对 Actor 输出的原始值分别施加不同的激活函数，得到动作均值。"""
-        mean_0 = torch.tanh(raw_action[..., 0:1]).clamp_(-1.0,1.0)      # 第一维 → [-1, 1]
-        mean_1 = torch.sigmoid(raw_action[..., 1:2]).clamp_(0.0,1.0)   # 第二维 → [0, 1]
+        # 避免任何原地操作，防止破坏 Sigmoid/Tanh 的反向传播图
+        raw_action = self._sanitize_tensor(raw_action)
+        mean_0 = torch.tanh(raw_action[..., 0:1])
+        mean_1 = torch.sigmoid(raw_action[..., 1:2])
         return torch.cat([mean_0, mean_1], dim=-1)
 
 
@@ -211,6 +218,7 @@ class PPO:
         # 优化器:Actor 和 Critic 使用各自的学习率(通过参数分组实现)
         self.optimizer = torch.optim.Adam([
             {'params': self.policy.actor.parameters(), 'lr': lr_actor},
+            {'params' : [self.policy.log_std],'lr': lr_actor},
             {'params': self.policy.critic.parameters(), 'lr': lr_critic}
         ])
 
@@ -219,6 +227,13 @@ class PPO:
         self.policy_old.load_state_dict(self.policy.state_dict())
 
         self.mse_loss = nn.MSELoss()   # 用于 Critic 的损失函数
+
+    @staticmethod
+    def _sanitize_tensor(t: torch.Tensor) -> torch.Tensor:
+        """清理 PPO 入口张量中的 NaN/Inf。"""
+        return torch.where(
+            torch.isnan(t) | torch.isinf(t), torch.zeros_like(t), t
+        )
 
     def select_action(self, state) -> int:
         """根据当前状态选择动作,并将经验存入缓冲区。
@@ -229,7 +244,7 @@ class PPO:
         Returns:
             action: 选出的动作(标量 int,用于离散动作空间)
         """
-        state = state.to(device)                     # 确保状态在正确的设备上
+        state = self._sanitize_tensor(state.to(device))                     # 确保状态在正确的设备上
         with torch.no_grad():                        # 采样时无需梯度
             action, logprob = self.policy_old.act(state)
 
@@ -242,6 +257,9 @@ class PPO:
 
     def update(self):
         """使用缓冲区中收集的经验更新策略网络(PPO 核心更新步骤)。"""
+        if not self.buffer.rewards:
+            return None
+
         # ========== 1. 计算折扣奖励(returns)并进行标准化 ==========
         rewards = []
         discounted_reward = 0
@@ -268,6 +286,10 @@ class PPO:
         old_logprobs = torch.tensor(self.buffer.logprobs, dtype=torch.float32, device=device).detach()
 
         # ========== 3. 多次 epoch 更新策略 ==========
+        actor_loss_value = 0.0
+        critic_loss_value = 0.0
+        total_loss_value = 0.0
+        entropy_value = 0.0
         for _ in range(self.K_epochs):
             # 在当前策略下评估这批数据
             logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
@@ -281,8 +303,21 @@ class PPO:
             # PPO 裁剪损失
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+            actor_loss = -torch.min(surr1, surr2)
+            critic_loss = self.mse_loss(state_values, rewards)
+            entropy_bonus = dist_entropy
             # 总损失 = -min(surr1, surr2) + 0.5 * (V - G)^2 - 0.01 * 熵
-            loss = -torch.min(surr1, surr2) + 0.5 * self.mse_loss(state_values, rewards) - 0.01 * dist_entropy
+            loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy_bonus
+
+            if not torch.isfinite(loss).all():
+                logger.warning("PPO update skipped because loss contains NaN/Inf")
+                self.buffer.clear()
+                return None
+
+            actor_loss_value = actor_loss.mean().item()
+            critic_loss_value = critic_loss.item()
+            total_loss_value = loss.mean().item()
+            entropy_value = entropy_bonus.mean().item()
 
             # 反向传播与参数更新
             self.optimizer.zero_grad()
@@ -295,6 +330,13 @@ class PPO:
         self.policy_old.load_state_dict(self.policy.state_dict())
         # 清空缓冲区,准备下一轮收集
         self.buffer.clear()
+        return {
+            "actor_loss": actor_loss_value,
+            "critic_loss": critic_loss_value,
+            "total_loss": total_loss_value,
+            "entropy": entropy_value,
+            "buffer_size": len(rewards),
+        }
 
     def load(self, checkpoint_path: str):
         """从文件加载模型权重(同时更新 policy 和 policy_old)。"""

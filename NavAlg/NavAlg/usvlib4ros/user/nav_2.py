@@ -18,6 +18,7 @@ from usvlib4ros.msg.parameter import Parameter
 from usvlib4ros.usvRosUtil import LogUtil
 from usvlib4ros.user.PP0_2 import PPO, device
 from usvlib4ros.user.reward import RewardConfig, compute_reward
+from usvlib4ros.user.training_logger import TrainingLogger
 
 # ==================== 超参数配置 ====================
 N_ACTIONS = 2          # 连续动作空间
@@ -100,7 +101,8 @@ class PPONav:
         self.data_collection_count = 0
         self.data_collection_max = 100
         self.data_collection_enabled = True
-        self.csv_path = Path("data_collection.csv")
+        self.training_logger = TrainingLogger(root_dir="Results", summary_interval=50)
+        self.csv_path = self.training_logger.run_dir / "data_collection.csv"
         self._init_csv_file()
 
         self.last_distance = None
@@ -126,7 +128,9 @@ class PPONav:
         self.episode_reward_sum = 0.0
         self.arrive = False
         self.done = False
+        self.timeout = False
         self.arrive_distance = ARRIVE_DISTANCE
+        self.episode_step_count = 0
 
         self.routePlaneService = RoutePlanService(
             wayPointRadius=self.arrive_distance, route=self.route
@@ -184,6 +188,9 @@ class PPONav:
 
                     # 本轮导航循环
                     self.episode_start_time = time.time()
+                    self.episode_step_count = 0
+                    self.timeout = False
+                    last_update_metrics = None
                     for step in range(MAX_STEP_PER_EPISODE):
                         if self.global_data.device_data.task_status == 0:
                             LogUtil.info(f"步骤 {step} 停止训练")
@@ -191,13 +198,19 @@ class PPONav:
 
                         if (time.time() - self.episode_start_time) > MAX_EPISODE_TIME:
                             LogUtil.info("本轮超时,提前结束")
+                            self.timeout = True
                             break
 
+                        self.episode_step_count = step + 1
                         self.done = self.navigationHandler(self.next_state, epoch, step)
 
                         # 定期更新PPO
                         if step > 0 and step % UPDATE_INTERVAL == 0:
-                            self.ppo_agent.update()
+                            last_update_metrics = self.ppo_agent.update()
+                            self.training_logger.log_update(
+                                epoch * MAX_STEP_PER_EPISODE + step,
+                                last_update_metrics,
+                            )
 
                         self.setMonitorParameterValue()
 
@@ -206,15 +219,34 @@ class PPONav:
 
                         time.sleep(0.1)
 
+                    if self.ppo_agent.buffer.rewards:
+                        last_update_metrics = self.ppo_agent.update()
+                        self.training_logger.log_update(
+                            epoch * MAX_STEP_PER_EPISODE + self.episode_step_count,
+                            last_update_metrics,
+                        )
+
                     # 定期保存模型
                     if epoch % CHECKPOINT_INTERVAL == 0:
-                        checkpoint_path = f"./PPO_ship_obstacle_{epoch}.pth"
+                        checkpoint_path = self.training_logger.checkpoint_dir / f"PPO_ship_obstacle_{epoch}.pth"
                         self.ppo_agent.save(checkpoint_path)
                         LogUtil.info(f"模型已保存: {checkpoint_path}")
+
+                    self.training_logger.log_episode(
+                        episode=epoch,
+                        episode_return=self.episode_reward_sum,
+                        steps=self.episode_step_count,
+                        episode_time_sec=(time.time() - self.episode_start_time) if self.episode_start_time else 0.0,
+                        arrived=self.arrive,
+                        collided=self.done and not self.arrive,
+                        timeout=self.timeout and not self.done and not self.arrive,
+                        last_update_metrics=last_update_metrics,
+                    )
 
             except Exception as e:
                 LogUtil.error(e)
             finally:
+                self.training_logger.close()
                 time.sleep(2)
 
     def _reset_episode_state(self):
@@ -224,9 +256,11 @@ class PPONav:
         self.last_distance = None
         self.done = False
         self.arrive = False
+        self.timeout = False
         self.destPointIndex = -1
         self.destPoint = None
         self.max_distance = 0.0
+        self.episode_step_count = 0
 
     # ==================== 状态获取 ====================
 
@@ -405,7 +439,6 @@ class PPONav:
             prev_distance=prev_distance,
             heading_world=heading,
             target_heading_world=degreeAship,
-            prev_distance=current_distance,
             episode_elapsed_time=time.time() - self.episode_start_time,
             config=self.reward_config,
         )
@@ -816,6 +849,10 @@ class PPONav:
                     "distance_reward_raw", "heading_reward_raw", "obstacle_reward_raw",
                     "total_reward", "done"
                 ])
+
+    def close(self):
+        if hasattr(self, "training_logger") and self.training_logger is not None:
+            self.training_logger.close()
 
 
 # 向后兼容：保留旧类名供main.py等外部引用

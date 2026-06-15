@@ -10,7 +10,6 @@ class RewardConfig:
     reward_weight_distance: float = 0.6
     reward_weight_obstacle: float = 0.2
     reward_weight_heading: float = 0.2
-    reward_weight_speed: float = 0.2
     progress_scale: float = 10.0
     obstacle_safe_range: float = 3.0
     obstacle_penalty_scale: float = 10.0
@@ -36,13 +35,11 @@ class RewardBreakdown:
     distance_reward: float
     heading_reward: float
     obstacle_reward: float
-    speed_reward: float
     total_reward: float
 
     distance_raw: float
     heading_raw: float
     obstacle_raw: float
-    speed_raw: float
 
 
 def compute_reward(
@@ -113,23 +110,14 @@ def compute_reward_breakdown(
     if current_distance < config.target_slow_range:
         obstacle_reward_raw = config.reward_near_target_bonus
 
-    speed_reward_raw = calc_speed_reward(
-        action=action,
-        angle_diff=angle_diff if angle_diff is not None else state[-4],
-        obstacle_min_range=obstacle_min_range,
-        config=config,
-    )
-
     distance_reward = distance_reward_raw * config.reward_weight_distance
     obstacle_reward = obstacle_reward_raw * config.reward_weight_obstacle
     heading_reward = heading_reward_raw * config.reward_weight_heading
-    speed_reward = speed_reward_raw * config.reward_weight_speed
 
     reward = (
         distance_reward
         + obstacle_reward
         + heading_reward
-        + speed_reward
         + config.step_penalty
     )
 
@@ -143,12 +131,10 @@ def compute_reward_breakdown(
         distance_reward=distance_reward,
         heading_reward=heading_reward,
         obstacle_reward=obstacle_reward,
-        speed_reward=speed_reward,
         total_reward=reward,
         distance_raw=distance_reward_raw,
         heading_raw=heading_reward_raw,
         obstacle_raw=obstacle_reward_raw,
-        speed_raw=speed_reward_raw,
     )
 
 
@@ -201,21 +187,6 @@ def calc_obstacle_reward(
 
     danger_ratio = (config.obstacle_safe_range - obstacle_min_range) / config.obstacle_safe_range
     return -(danger_ratio ** 2) * config.obstacle_penalty_scale
-
-
-def calc_speed_reward(
-    action: int | float | list | tuple,
-    angle_diff: float,
-    obstacle_min_range: float,
-    config: RewardConfig = DEFAULT_REWARD_CONFIG,
-) -> float:
-    _, speed_action = _split_action(action)
-    normalized_speed = max(-1.0, min(1.0, speed_action))
-
-    if abs(angle_diff) < 30 and obstacle_min_range >= config.obstacle_safe_range:
-        return max(0.0, normalized_speed)
-
-    return -abs(normalized_speed)
 
 
 def calc_time_reward_weight(
