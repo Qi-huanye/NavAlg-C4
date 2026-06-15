@@ -2,6 +2,7 @@ import math
 import time
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -13,6 +14,7 @@ from usvlib4ros.msg.parameter import Parameter
 from usvlib4ros.usvRosUtil import LogUtil
 from usvlib4ros.user.PP0_2 import PPO, device
 from usvlib4ros.user.reward import RewardConfig, compute_reward
+from usvlib4ros.user.tensorboard_logging import TensorBoardMetricsWriter, build_tensorboard_log_dir
 
 # ==================== 超参数配置 ====================
 N_ACTIONS = 2          # 连续动作空间
@@ -82,11 +84,15 @@ class PPONav:
         self.ros_ctrl: Ros2Controller = ros_ctrl
         self.global_data: GlobalData = global_data
         self.navThread = None
+        self.current_episode_step = 0
+        self.tb_log_dir = build_tensorboard_log_dir(Path.cwd() / "runs")
+        self.tb_writer = TensorBoardMetricsWriter(log_dir=self.tb_log_dir)
 
         # PPO智能体
         self.ppo_agent = PPO(
             N_STATES, N_ACTIONS, LR_ACTOR, LR_CRITIC,
-            GAMMA, K_EPOCHS, EPS_CLIP, HAS_CONTINUOUS_ACTION, ACTION_STD_INIT
+            GAMMA, K_EPOCHS, EPS_CLIP, HAS_CONTINUOUS_ACTION, ACTION_STD_INIT,
+            writer=self.tb_writer.writer
         )
         self.next_state = None
         self.action_size = N_ACTIONS  # 动作空间大小(用于角度映射)
@@ -163,6 +169,7 @@ class PPONav:
                     # 本轮导航循环
                     self.episode_start_time = time.time()
                     for step in range(MAX_STEP_PER_EPISODE):
+                        self.current_episode_step = step + 1
                         if self.global_data.device_data.task_status == 0:
                             LogUtil.info(f"步骤 {step} 停止训练")
                             break
@@ -180,9 +187,13 @@ class PPONav:
                         self.setMonitorParameterValue()
 
                         if self.done or self.arrive:
+                            self._log_episode_metrics(epoch)
                             break
 
                         time.sleep(0.1)
+
+                    if not self.done and not self.arrive and self.current_episode_step > 0:
+                        self._log_episode_metrics(epoch)
 
                     # 定期保存模型
                     if epoch % CHECKPOINT_INTERVAL == 0:
@@ -193,11 +204,13 @@ class PPONav:
             except Exception as e:
                 LogUtil.error(e)
             finally:
+                self._close_tensorboard_writer()
                 time.sleep(2)
 
     def _reset_episode_state(self):
         """重置单轮训练的状态变量。"""
         self.episode_reward_sum = 0.0
+        self.current_episode_step = 0
         self.next_state = None
         self.done = False
         self.arrive = False
@@ -652,6 +665,25 @@ class PPONav:
             f"航点={self.destPointIndex} 距离={nav_context['shipToNextWPDistance']:.1f}m "
             f"速度=... 转向=..."
         )
+
+    def _log_episode_metrics(self, episode: int):
+        if self.tb_writer is None:
+            return
+        self.tb_writer.log_episode(
+            episode=episode,
+            reward=self.episode_reward_sum,
+            length=self.current_episode_step,
+        )
+
+    def _close_tensorboard_writer(self):
+        if self.tb_writer is None:
+            return
+        try:
+            self.tb_writer.close()
+        except Exception as exc:
+            LogUtil.error(f"关闭TensorBoard writer失败: {exc}")
+        finally:
+            self.tb_writer = None
 
     # ==================== 参数注册 ====================
 

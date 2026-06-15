@@ -24,6 +24,10 @@ dist/
 .coverage
 .coverage.*
 htmlcov/
+docs/
+runs/
+tests/
+sth.md
 
 # IDE / editor
 .idea/

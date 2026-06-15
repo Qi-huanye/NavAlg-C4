@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical, MultivariateNormal
 
+from usvlib4ros.user.tensorboard_logging import TensorBoardMetricsWriter
+
 logger = logging.getLogger(__name__)
 
 # Device configuration
@@ -183,7 +185,8 @@ class PPO:
     def __init__(self, state_dim: int, action_dim: int,
                  lr_actor: float, lr_critic: float,
                  gamma: float, K_epochs: int, eps_clip: float,
-                 has_continuous_action_space: bool, action_std_init: float):
+                 has_continuous_action_space: bool, action_std_init: float,
+                 writer=None):
         """初始化 PPO 算法的超参数、网络和优化器。
 
         Args:
@@ -219,6 +222,8 @@ class PPO:
         self.policy_old.load_state_dict(self.policy.state_dict())
 
         self.mse_loss = nn.MSELoss()   # 用于 Critic 的损失函数
+        self.tb_writer = TensorBoardMetricsWriter(writer=writer) if writer is not None else None
+        self.update_step = 0
 
     def select_action(self, state) -> int:
         """根据当前状态选择动作,并将经验存入缓冲区。
@@ -255,7 +260,8 @@ class PPO:
         # 转为张量并移至设备
         rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
         # 标准化奖励(优势函数通常需要,但此处直接用于 Critic 目标)
-        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
+        rewards_std = rewards.std(unbiased=False)
+        rewards = (rewards - rewards.mean()) / (rewards_std + 1e-7)
 
         # ========== 2. 将缓冲区中的列表数据转换为张量 ==========
         # 状态:从列表转换并堆叠
@@ -268,6 +274,12 @@ class PPO:
         old_logprobs = torch.tensor(self.buffer.logprobs, dtype=torch.float32, device=device).detach()
 
         # ========== 3. 多次 epoch 更新策略 ==========
+        total_loss_value = 0.0
+        policy_loss_value = 0.0
+        value_loss_value = 0.0
+        entropy_value = 0.0
+        ratio_mean_value = 0.0
+        advantage_mean_value = 0.0
         for _ in range(self.K_epochs):
             # 在当前策略下评估这批数据
             logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
@@ -282,7 +294,17 @@ class PPO:
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
             # 总损失 = -min(surr1, surr2) + 0.5 * (V - G)^2 - 0.01 * 熵
-            loss = -torch.min(surr1, surr2) + 0.5 * self.mse_loss(state_values, rewards) - 0.01 * dist_entropy
+            policy_loss = -torch.min(surr1, surr2)
+            value_loss = 0.5 * self.mse_loss(state_values, rewards)
+            entropy_bonus = -0.01 * dist_entropy
+            loss = policy_loss + value_loss + entropy_bonus
+
+            total_loss_value = loss.mean().item()
+            policy_loss_value = policy_loss.mean().item()
+            value_loss_value = value_loss.mean().item()
+            entropy_value = dist_entropy.mean().item()
+            ratio_mean_value = ratios.mean().item()
+            advantage_mean_value = advantages.mean().item()
 
             # 反向传播与参数更新
             self.optimizer.zero_grad()
@@ -290,6 +312,18 @@ class PPO:
             # 梯度裁剪防止梯度爆炸
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)
             self.optimizer.step()
+
+        if self.tb_writer is not None:
+            self.tb_writer.log_update(
+                self.update_step,
+                total_loss_value,
+                policy_loss_value,
+                value_loss_value,
+                entropy_value,
+                ratio_mean_value,
+                advantage_mean_value,
+            )
+        self.update_step += 1
 
         # 更新完成后,将旧策略网络同步为当前策略网络
         self.policy_old.load_state_dict(self.policy.state_dict())
