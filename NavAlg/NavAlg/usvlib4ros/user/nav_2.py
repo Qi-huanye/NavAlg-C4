@@ -41,7 +41,7 @@ CHECKPOINT_INTERVAL = 100  # 模型保存间隔(轮数)
 # ==================== 导航常量 ====================
 LASER_MAX_RANGE = 5.0        # 激光雷达有效最大距离(m)
 LASER_FRONT_HALF_DEG = 180   # 前方扫描扇区角度(度),仅用于碰撞检测
-COLLISION_DISTANCE = 0.6     # 碰撞判定阈值(m)
+COLLISION_DISTANCE = 0.5     # 碰撞判定阈值(m)
 ARRIVE_DISTANCE = 1.0        # 到达目标判定阈值(m)
 DEFAULT_SPEED = 1.0          # 默认速度(m/s)
 OBSTACLE_SLOW_RANGE = 4.0    # 进入此范围开始减速(m)
@@ -60,9 +60,9 @@ REWARD_ARRIVE_BONUS = 1000      # 到达奖励
 REWARD_COLLISION_PENALTY = -500 # 碰撞惩罚
 REWARD_OBSTACLE_PENALTY = -5    # 接近障碍物惩罚
 REWARD_NEAR_TARGET_BONUS = 1    # 靠近目标奖励
-REWARD_WEIGHT_DISTANCE = 0.6    # 距离奖励权重
-REWARD_WEIGHT_OBSTACLE = 0.2    # 障碍物惩罚权重
-REWARD_WEIGHT_HEADING = 0.2     # 航向奖励权重
+REWARD_WEIGHT_DISTANCE = 0.8    # 距离奖励权重
+REWARD_WEIGHT_OBSTACLE = 0.4    # 障碍物惩罚权重
+REWARD_WEIGHT_HEADING = 0.4     # 航向奖励权重
 
 
 @dataclass

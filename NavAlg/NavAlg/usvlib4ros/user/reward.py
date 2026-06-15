@@ -7,9 +7,9 @@ class RewardConfig:
     reward_arrive_bonus: float = 1000
     reward_collision_penalty: float = -500
     reward_near_target_bonus: float = 1
-    reward_weight_distance: float = 0.6
-    reward_weight_obstacle: float = 0.2
-    reward_weight_heading: float = 0.2
+    reward_weight_distance: float = 0.8
+    reward_weight_obstacle: float = 0.4
+    reward_weight_heading: float = 0.4
     progress_scale: float = 10.0
     obstacle_safe_range: float = 3.0
     obstacle_penalty_scale: float = 10.0

@@ -18,10 +18,11 @@ class RolloutBuffer:
     """
 
     def __init__(self):
-        """初始化五个空列表,分别存储不同类别的数据。"""
+        """初始化缓冲区列表。"""
         self.actions = []      # 动作列表(标量或向量)
         self.states = []       # 状态列表(向量)
         self.logprobs = []     # 动作对数概率列表
+        self.state_values = [] # 状态价值估计列表
         self.rewards = []      # 即时奖励列表
         self.is_terminals = [] # 终止标志列表(True/False,表示是否为终止状态)
 
@@ -30,6 +31,7 @@ class RolloutBuffer:
         self.actions.clear()
         self.states.clear()
         self.logprobs.clear()
+        self.state_values.clear()
         self.rewards.clear()
         self.is_terminals.clear()
 
@@ -57,9 +59,10 @@ class ActorCritic(nn.Module):
         #如果是连续动作空间,初始化动作方差
         if has_continuous_action_space:
             self.action_dim = action_dim
-            # 初始化动作方差向量(对角矩阵的主对角线元素),并移至目标设备
-            self.log_std = nn.Parameter(torch.full((action_dim,),math.log(action_std_init)))
-            self.action_var = torch.full((action_dim,), action_std_init * action_std_init).to(device)
+            # 学习 log_std 比直接学习方差更稳定,并可保证 std 始终为正
+            self.log_std = nn.Parameter(
+                torch.full((action_dim,), math.log(action_std_init), dtype=torch.float32)
+            )
 
         # ========== Actor 网络 ==========
         # 输入状态 -> 输出动作的概率(离散)或动作均值(连续)
@@ -122,8 +125,9 @@ class ActorCritic(nn.Module):
             # 连续动作空间:Actor 输出动作均值,使用对角协方差矩阵构建正态分布
             raw = self.actor(state)
             action_mean = self._get_action_mean(raw)
-            std = torch.exp(self.log_std) # 标准差向量
-            scale_tril = torch.diag(std) # 更新协方差矩阵
+            log_std = torch.clamp(self.log_std, min=-2.5, max=0.5)
+            std = torch.exp(log_std)  # 标准差向量
+            scale_tril = torch.diag(std)
             dist = MultivariateNormal(action_mean, scale_tril=scale_tril)
 
         else:
@@ -157,8 +161,8 @@ class ActorCritic(nn.Module):
             raw = self._sanitize_tensor(self.actor(state))
             action_mean = self._get_action_mean(raw)
             action_mean = self._sanitize_tensor(action_mean)
-            # 将固定方差扩展到与批量数据相同的形状
-            std = torch.exp(self.log_std)                     # 标准差向量
+            log_std = torch.clamp(self.log_std, min=-2.5, max=0.5)
+            std = torch.exp(log_std)                         # 标准差向量
             # 扩展到批次维度：将 (action_dim,) 复制到 (batch, action_dim)
             std_batch = std.unsqueeze(0).expand(action_mean.size(0), -1)
             scale_tril = torch.diag_embed(std_batch)          # 批量对角矩阵
@@ -190,7 +194,8 @@ class PPO:
     def __init__(self, state_dim: int, action_dim: int,
                  lr_actor: float, lr_critic: float,
                  gamma: float, K_epochs: int, eps_clip: float,
-                 has_continuous_action_space: bool, action_std_init: float):
+                 has_continuous_action_space: bool, action_std_init: float,
+                 gae_lambda: float = 0.95):
         """初始化 PPO 算法的超参数、网络和优化器。
 
         Args:
@@ -209,6 +214,7 @@ class PPO:
             self.action_std = action_std_init   # 保存初始标准差,但代码中未使用动态调整
 
         self.gamma = gamma
+        self.gae_lambda = gae_lambda
         self.eps_clip = eps_clip
         self.K_epochs = K_epochs
         self.buffer = RolloutBuffer()           # 经验缓冲区
@@ -247,11 +253,13 @@ class PPO:
         state = self._sanitize_tensor(state.to(device))                     # 确保状态在正确的设备上
         with torch.no_grad():                        # 采样时无需梯度
             action, logprob = self.policy_old.act(state)
+            state_value = self.policy_old.critic(state).squeeze(-1)
 
         # 将状态、动作、对数概率存储到缓冲区(转为 Python 列表以方便后续 JSON 序列化)
         self.buffer.states.append(state.cpu().numpy().tolist())
         self.buffer.actions.append(action.cpu().numpy().tolist())
         self.buffer.logprobs.append(logprob.cpu().numpy().tolist())
+        self.buffer.state_values.append(float(state_value.item()))
 
         return action.cpu().numpy() if self.has_continuous_action_space else action.item()  # 返回标量动作值
 
@@ -260,22 +268,7 @@ class PPO:
         if not self.buffer.rewards:
             return None
 
-        # ========== 1. 计算折扣奖励(returns)并进行标准化 ==========
-        rewards = []
-        discounted_reward = 0
-        # 从后向前计算折扣累计奖励(G_t = r_t + gamma * G_{t+1})
-        for reward, is_terminal in zip(reversed(self.buffer.rewards), reversed(self.buffer.is_terminals)):
-            if is_terminal:
-                discounted_reward = 0   # 终止状态后奖励重置
-            discounted_reward = reward + (self.gamma * discounted_reward)
-            rewards.insert(0, discounted_reward)
-
-        # 转为张量并移至设备
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
-        # 标准化奖励(优势函数通常需要,但此处直接用于 Critic 目标)
-        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
-
-        # ========== 2. 将缓冲区中的列表数据转换为张量 ==========
+        # ========== 1. 将缓冲区中的列表数据转换为张量 ==========
         # 状态:从列表转换并堆叠
         old_states = torch.tensor(self.buffer.states, dtype=torch.float32, device=device).detach()
         # 动作
@@ -284,6 +277,25 @@ class PPO:
             old_actions = old_actions.unsqueeze(-1)
         # 旧对数概率
         old_logprobs = torch.tensor(self.buffer.logprobs, dtype=torch.float32, device=device).detach()
+        old_state_values = torch.tensor(self.buffer.state_values, dtype=torch.float32, device=device).detach()
+
+        # ========== 2. 使用真实 GAE 计算优势和 returns ==========
+        rewards = torch.tensor(self.buffer.rewards, dtype=torch.float32, device=device)
+        terminals = torch.tensor(self.buffer.is_terminals, dtype=torch.float32, device=device)
+
+        advantages = torch.zeros_like(rewards)
+        gae = torch.tensor(0.0, dtype=torch.float32, device=device)
+        next_value = torch.tensor(0.0, dtype=torch.float32, device=device)
+
+        for step in reversed(range(len(rewards))):
+            mask = 1.0 - terminals[step]
+            delta = rewards[step] + self.gamma * next_value * mask - old_state_values[step]
+            gae = delta + self.gamma * self.gae_lambda * mask * gae
+            advantages[step] = gae
+            next_value = old_state_values[step]
+
+        returns = advantages + old_state_values
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-7)
 
         # ========== 3. 多次 epoch 更新策略 ==========
         actor_loss_value = 0.0
@@ -297,14 +309,12 @@ class PPO:
                 
             # 计算概率比 r(θ) = π_θ(a|s) / π_old(a|s)
             ratios = torch.exp(logprobs - old_logprobs.detach())
-            # 优势估计:A = G - V(s)
-            advantages = rewards - state_values.detach()
 
             # PPO 裁剪损失
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
             actor_loss = -torch.min(surr1, surr2)
-            critic_loss = self.mse_loss(state_values, rewards)
+            critic_loss = self.mse_loss(state_values, returns)
             entropy_bonus = dist_entropy
             # 总损失 = -min(surr1, surr2) + 0.5 * (V - G)^2 - 0.01 * 熵
             loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy_bonus
@@ -335,7 +345,7 @@ class PPO:
             "critic_loss": critic_loss_value,
             "total_loss": total_loss_value,
             "entropy": entropy_value,
-            "buffer_size": len(rewards),
+            "buffer_size": len(self.buffer.rewards),
         }
 
     def load(self, checkpoint_path: str):
