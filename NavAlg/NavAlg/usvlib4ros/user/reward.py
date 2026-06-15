@@ -22,6 +22,10 @@ class RewardConfig:
     has_continuous_action: bool = True
     n_actions: int = 1
     speed_scale: float = 100.0
+    apf_attractive_gain: float = 1.0
+    apf_repulsive_gain: float = 1.0
+    apf_obstacle_influence_range: float = 3.0
+    apf_heading_repulsive_weight: float = 1.0
 
 
 DEFAULT_REWARD_CONFIG = RewardConfig()
@@ -36,6 +40,8 @@ def compute_reward(
     done: bool,
     prev_distance: float | None = None,
     episode_elapsed_time: float | None = None,
+    heading_world: float | None = None,
+    target_heading_world: float | None = None,
     config: RewardConfig = DEFAULT_REWARD_CONFIG,
 ) -> float:
     obstacle_min_range = state[-2]
@@ -51,6 +57,10 @@ def compute_reward(
         angle_diff=angle_diff if angle_diff is not None else state[-4],
         current_distance=current_distance,
         max_distance=max_distance,
+        obstacle_min_range=obstacle_min_range,
+        obstacle_angle=state[-1],
+        heading_world=heading_world,
+        target_heading_world=target_heading_world,
         config=config,
     )
     obstacle_reward = calc_obstacle_reward(obstacle_min_range, config)
@@ -167,6 +177,10 @@ def calc_heading_reward(
     angle_diff: float,
     current_distance: float,
     max_distance: float,
+    obstacle_min_range: float | None = None,
+    obstacle_angle: float | None = None,
+    heading_world: float | None = None,
+    target_heading_world: float | None = None,
     config: RewardConfig = DEFAULT_REWARD_CONFIG,
 ) -> float:
     distance_rate = 2 ** (current_distance / max_distance) if max_distance > 0 else 1.0
@@ -181,11 +195,64 @@ def calc_heading_reward(
             yaw_rewards.append(tr)
         return round(yaw_rewards[action] * 5, 2) * distance_rate
 
+    if obstacle_min_range is not None and obstacle_angle is not None:
+        apf_heading_diff = calc_apf_heading_diff(
+            angle_diff=angle_diff,
+            current_distance=current_distance,
+            obstacle_min_range=obstacle_min_range,
+            obstacle_angle=obstacle_angle,
+            heading_world=heading_world,
+            target_heading_world=target_heading_world,
+            config=config,
+        )
+    else:
+        apf_heading_diff = angle_diff
+
     predicted_angle_diff = _normalize_signed_angle_diff(
-        angle_diff - turn_action * config.angular_velocity_max * config.control_dt
+        apf_heading_diff - turn_action * config.angular_velocity_max * config.control_dt
     )
     heading_reward = 1 - 2 * (abs(predicted_angle_diff) / 180.0)
-    return round(heading_reward, 2)
+    return round(heading_reward, 2) * distance_rate
+
+
+def calc_apf_heading_diff(
+    angle_diff: float,
+    current_distance: float,
+    obstacle_min_range: float,
+    obstacle_angle: float,
+    heading_world: float | None,
+    target_heading_world: float | None,
+    config: RewardConfig = DEFAULT_REWARD_CONFIG,
+) -> float:
+    heading_world = 0.0 if heading_world is None else heading_world
+    if target_heading_world is None:
+        target_heading_world = heading_world + angle_diff
+
+    target_rad = math.radians(target_heading_world)
+    attractive_strength = config.apf_attractive_gain * max(float(current_distance), 0.0)
+    attractive_x = attractive_strength * math.cos(target_rad)
+    attractive_y = attractive_strength * math.sin(target_rad)
+
+    repulsive_x = 0.0
+    repulsive_y = 0.0
+    rho = max(float(obstacle_min_range), 1e-3)
+    rho_0 = config.apf_obstacle_influence_range
+    if rho < rho_0:
+        force_magnitude = config.apf_repulsive_gain * (1.0 / rho - 1.0 / rho_0) / (rho * rho)
+        obstacle_relative_deg = float(obstacle_angle) * 2.0 - 90.0
+        obstacle_world_deg = heading_world + obstacle_relative_deg
+        obstacle_rad = math.radians(obstacle_world_deg)
+        repulsive_strength = force_magnitude * config.apf_heading_repulsive_weight
+        repulsive_x = -repulsive_strength * math.cos(obstacle_rad)
+        repulsive_y = -repulsive_strength * math.sin(obstacle_rad)
+
+    apf_x = attractive_x + repulsive_x
+    apf_y = attractive_y + repulsive_y
+    if abs(apf_x) < 1e-6 and abs(apf_y) < 1e-6:
+        return _normalize_signed_angle_diff(angle_diff)
+
+    apf_heading_world = math.degrees(math.atan2(apf_y, apf_x))
+    return _normalize_signed_angle_diff(apf_heading_world - heading_world)
 
 
 def _normalize_signed_angle_diff(angle: float) -> float:

@@ -50,6 +50,9 @@ ACTION_TO_DEGREE_SCALE = 1   # 动作到转向角度的缩放因子
 ACTION_TO_DEGREE_CONTINOUS_SCALE = 100 # 连续动作映射到转向角度缩放因子
 ACTION_TO_SPEED_CONTINOUS_SCALE = 200 # 连续动作映射到速度缩放因子
 CONTROL_DT = 0.1             # 控制周期(s),用于连续动作
+TARGET_ECHO_ANGLE_WINDOW_DEG = 8.0
+TARGET_ECHO_RANGE_MARGIN = 1.0
+TARGET_ECHO_MIN_DISTANCE = 0.5
 
 # ==================== 奖励权重 ====================
 REWARD_ARRIVE_BONUS = 1000      # 到达奖励
@@ -251,8 +254,11 @@ class PPONav:
         angle_diff = self._normalize_signed_angle_diff(target_abs - heading_abs)
 
         scan_range = self._extract_laser_features(scan)
-        obstacle_min_range = round(min(scan_range), 2)
-        obstacle_angle = np.argmin(scan_range)
+        obstacle_min_range, obstacle_angle = self._extract_obstacle_feature(
+            scan_range=scan_range,
+            angle_diff=angle_diff,
+            current_distance=current_distance,
+        )
 
         LogUtil.debug(
             f"状态: heading={heading:.2f}, distance={current_distance:.2f}, "
@@ -291,6 +297,41 @@ class PPONav:
             else:
                 scan_range.append(value)
         return scan_range
+
+    def _extract_obstacle_feature(
+        self,
+        scan_range: list,
+        angle_diff: float,
+        current_distance: float,
+    ) -> tuple[float, float]:
+        if not scan_range:
+            return LASER_MAX_RANGE, 0.0
+
+        filtered_scan = list(scan_range)
+        target_index = self._target_angle_to_scan_index(angle_diff, len(filtered_scan))
+        if target_index is not None and current_distance > TARGET_ECHO_MIN_DISTANCE:
+            window_bins = max(1, int(round(TARGET_ECHO_ANGLE_WINDOW_DEG / 2.0)))
+            start = max(0, target_index - window_bins)
+            end = min(len(filtered_scan), target_index + window_bins + 1)
+            for idx in range(start, end):
+                if abs(filtered_scan[idx] - current_distance) <= TARGET_ECHO_RANGE_MARGIN:
+                    filtered_scan[idx] = LASER_MAX_RANGE
+
+        obstacle_idx = int(np.argmin(filtered_scan))
+        obstacle_min_range = round(float(filtered_scan[obstacle_idx]), 2)
+        if obstacle_min_range >= LASER_MAX_RANGE:
+            obstacle_idx = int(np.argmin(scan_range))
+            obstacle_min_range = round(float(scan_range[obstacle_idx]), 2)
+
+        return obstacle_min_range, float(obstacle_idx)
+
+    def _target_angle_to_scan_index(self, angle_diff: float, scan_len: int) -> int | None:
+        if scan_len <= 0:
+            return None
+        if angle_diff < -90.0 or angle_diff > 90.0:
+            return None
+        raw_index = int(round((angle_diff + 90.0) / 2.0))
+        return max(0, min(scan_len - 1, raw_index))
 
     def _is_last_waypoint_reached(self, current_distance: float) -> bool:
         """判断是否到达最后一个航路点。"""
@@ -356,9 +397,39 @@ class PPONav:
         # 动作到控制量的映射
         adviseRotate, adviseSpeed = self._action_to_control(action, obstacle_min_range, current_distance)
 
+        # 先把控制量写回环境，再等待环境刷新出新观测
+        self.global_data.updateThrottleRudderOutput(
+            adviseSpeed, adviseRotate, heading, self.destPointIndex, current_distance
+        )
+
+        refreshed_laser_scan = self._wait_for_laser_data()
+        if refreshed_laser_scan is None:
+            refreshed_laser_scan = laser_scan
+
+        refreshed_pose_info = self._load_vehicle_pose_info()
+        refreshed_nav_context = self._update_navigation_target(refreshed_pose_info)
+        if refreshed_nav_context is None:
+            refreshed_heading = heading
+            refreshed_distance = shipToNextWPDistance
+            refreshed_degreeAship = degreeAship
+            refreshed_speed = pose.speed
+            refreshed_rotate_speed = pose.rotate_speed
+        else:
+            refreshed_heading = refreshed_pose_info[4]
+            refreshed_speed = refreshed_pose_info[5]
+            refreshed_rotate_speed = refreshed_pose_info[6]
+            refreshed_distance = refreshed_nav_context["shipToNextWPDistance"]
+            refreshed_degreeAship = refreshed_nav_context["degreeAship"]
+
         # 获取新状态
-        pose = self.global_data.scada_data.pose
-        new_state = self.getState(laser_scan, heading, shipToNextWPDistance, degreeAship, pose.speed, pose.rotate_speed)
+        new_state = self.getState(
+            refreshed_laser_scan,
+            refreshed_heading,
+            refreshed_distance,
+            refreshed_degreeAship,
+            refreshed_speed,
+            refreshed_rotate_speed,
+        )
         reward = compute_reward(
             state=new_state,
             action=action,
@@ -368,6 +439,8 @@ class PPONav:
             done=self.done,
             prev_distance=current_distance,
             episode_elapsed_time=time.time() - self.episode_start_time,
+            heading_world=refreshed_heading,
+            target_heading_world=refreshed_degreeAship,
             config=self.reward_config,
         )
         if self.arrive:
@@ -378,7 +451,7 @@ class PPONav:
         return StepResult(
             next_state=np.asarray(new_state),
             reward=reward,
-            current_distance=current_distance,
+            current_distance=refreshed_distance,
             advise_speed=adviseSpeed,
             advise_rotate=adviseRotate,
             advised_heading=heading,
@@ -745,10 +818,6 @@ class PPONav:
         self.global_data.updateAlgorithmOutput(
             episode, step, int(self.episode_reward_sum),
             result.reward, MAX_EPOCH, 2
-        )
-        self.global_data.updateThrottleRudderOutput(
-            result.advise_speed, result.advise_rotate, result.advised_heading,
-            nextPointIndex, result.current_distance
         )
 
     def _log_navigation_result(self, nav_context: dict):
