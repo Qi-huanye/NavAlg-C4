@@ -1,15 +1,28 @@
 import csv
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+_LIVE_PLOT_ENV = os.environ.get("USV_TRAINING_LIVE_PLOT", "0") == "1"
+
 try:
     import matplotlib
-    matplotlib.use("Agg")
+    if _LIVE_PLOT_ENV:
+        try:
+            matplotlib.use("TkAgg")
+        except Exception:
+            matplotlib.use("Agg")
+            _LIVE_PLOT_ENV = False
+    else:
+        matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    if _LIVE_PLOT_ENV:
+        plt.ion()
 except Exception:  # pragma: no cover
     plt = None
+    _LIVE_PLOT_ENV = False
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -45,6 +58,7 @@ class TrainingLogger:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.plot_dir = self.run_dir / "plots"
         self.plot_dir.mkdir(parents=True, exist_ok=True)
+        self.live_plot_enabled = _LIVE_PLOT_ENV and plt is not None
 
         self.summary_interval = max(1, int(summary_interval))
         self.episode_csv_path = self.run_dir / "episode_metrics.csv"
@@ -64,8 +78,11 @@ class TrainingLogger:
         self._episode_rows: list[dict[str, Any]] = []
         self._summary_rows: list[dict[str, Any]] = []
         self._update_rows: list[dict[str, Any]] = []
+        self._live_figures: dict[str, tuple[Any, Any]] = {}
 
         self._init_csv_files()
+        if self.live_plot_enabled:
+            self._init_live_windows()
 
     def _init_csv_files(self):
         self._write_csv_header(
@@ -160,6 +177,7 @@ class TrainingLogger:
             self.writer.add_scalar("policy/entropy", update_metrics["entropy"], global_step)
 
         self._plot_update_metrics()
+        self._refresh_live_windows()
 
     def log_episode(
         self,
@@ -326,12 +344,14 @@ class TrainingLogger:
             self.writer.add_scalar("window50/avg_return", avg_return_window, episode)
 
         self._plot_summary_metrics()
+        self._refresh_live_windows()
 
     def close(self):
         if self._window:
             last_episode = self._window[-1].episode
             self._flush_window_summary(last_episode)
         self._plot_all()
+        self._refresh_live_windows(force_draw=True)
         if self.writer:
             self.writer.flush()
             self.writer.close()
@@ -346,6 +366,7 @@ class TrainingLogger:
         self._plot_episode_metrics()
         self._plot_update_metrics()
         self._plot_summary_metrics()
+        self._refresh_live_windows()
 
     def _plot_episode_metrics(self):
         if plt is None or not self._episode_rows:
@@ -517,3 +538,100 @@ class TrainingLogger:
         fig.tight_layout()
         fig.savefig(path, dpi=160)
         plt.close(fig)
+
+    def _init_live_windows(self):
+        if plt is None:
+            return
+
+        self._live_figures["episode"] = plt.subplots(2, 2, figsize=(11, 7))
+        self._live_figures["update"] = plt.subplots(2, 2, figsize=(11, 7))
+        self._live_figures["summary"] = plt.subplots(1, 2, figsize=(11, 4.5))
+
+        for key, (fig, axes) in self._live_figures.items():
+            try:
+                fig.canvas.manager.set_window_title(f"USV Training - {key}")
+            except Exception:
+                pass
+            fig.tight_layout()
+            fig.show()
+
+    def _refresh_live_windows(self, force_draw: bool = False):
+        if not self.live_plot_enabled or plt is None:
+            return
+
+        self._draw_live_episode_window()
+        self._draw_live_update_window()
+        self._draw_live_summary_window()
+
+        if force_draw:
+            plt.pause(0.001)
+        else:
+            plt.pause(0.0001)
+
+    def _draw_live_episode_window(self):
+        if "episode" not in self._live_figures or not self._episode_rows:
+            return
+        fig, axes = self._live_figures["episode"]
+        for ax in axes.flat:
+            ax.clear()
+
+        episodes = [row["episode"] for row in self._episode_rows]
+        axes[0, 0].plot(episodes, [row["episode_return"] for row in self._episode_rows], color="tab:blue")
+        axes[0, 0].set_title("Episode Return")
+        axes[0, 1].plot(episodes, [row["steps"] for row in self._episode_rows], color="tab:orange")
+        axes[0, 1].set_title("Episode Steps")
+        axes[1, 0].plot(episodes, [row["episode_time_sec"] for row in self._episode_rows], color="tab:green")
+        axes[1, 0].set_title("Episode Time")
+        axes[1, 1].plot(episodes, [row["success_rate_total"] for row in self._episode_rows], label="Success", color="tab:green")
+        axes[1, 1].plot(episodes, [row["collision_rate_total"] for row in self._episode_rows], label="Collision", color="tab:red")
+        axes[1, 1].set_title("Success / Collision")
+        axes[1, 1].legend()
+        for ax in axes.flat:
+            ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.canvas.draw_idle()
+
+    def _draw_live_update_window(self):
+        if "update" not in self._live_figures or not self._update_rows:
+            return
+        fig, axes = self._live_figures["update"]
+        for ax in axes.flat:
+            ax.clear()
+
+        steps = [row["update_step"] for row in self._update_rows]
+        axes[0, 0].plot(steps, [row["actor_loss"] for row in self._update_rows], label="Actor")
+        axes[0, 0].plot(steps, [row["critic_loss"] for row in self._update_rows], label="Critic")
+        axes[0, 0].plot(steps, [row["total_loss"] for row in self._update_rows], label="Total")
+        axes[0, 0].set_title("PPO Loss")
+        axes[0, 0].legend()
+        axes[0, 1].plot(steps, [row["entropy"] for row in self._update_rows], color="tab:purple")
+        axes[0, 1].set_title("Entropy")
+        axes[1, 0].plot(steps, [row["buffer_size"] for row in self._update_rows], color="tab:brown")
+        axes[1, 0].set_title("Buffer Size")
+        for ax in axes.flat:
+            ax.grid(True, alpha=0.3)
+        axes[1, 1].axis("off")
+        fig.tight_layout()
+        fig.canvas.draw_idle()
+
+    def _draw_live_summary_window(self):
+        if "summary" not in self._live_figures or not self._summary_rows:
+            return
+        fig, axes = self._live_figures["summary"]
+        for ax in axes.flat:
+            ax.clear()
+
+        episodes = [row["episode_end"] for row in self._summary_rows]
+        axes[0].plot(episodes, [row["success_rate_window"] for row in self._summary_rows], label="Success")
+        axes[0].plot(episodes, [row["collision_rate_window"] for row in self._summary_rows], label="Collision")
+        axes[0].set_title("Window Rates")
+        axes[0].legend()
+        axes[1].plot(episodes, [row["avg_return_window"] for row in self._summary_rows], label="Return")
+        axes[1].plot(episodes, [row["avg_steps_window"] for row in self._summary_rows], label="Steps")
+        axes[1].plot(episodes, [row["avg_episode_time_window"] for row in self._summary_rows], label="Time")
+        axes[1].set_title("Window Efficiency")
+        axes[1].legend()
+        for ax in axes.flat:
+            ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.canvas.draw_idle()

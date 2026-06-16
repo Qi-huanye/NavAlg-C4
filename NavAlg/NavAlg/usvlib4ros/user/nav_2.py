@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import csv
 import os
 from pathlib import Path
+import cv2
 from usvlib4ros.user.reward import RewardConfig, compute_reward_breakdown, RewardBreakdown
 
 import numpy as np
@@ -17,7 +18,7 @@ from usvlib4ros.msg.global_data import GlobalData, DictToObject, Point, Constant
 from usvlib4ros.msg.parameter import Parameter
 from usvlib4ros.usvRosUtil import LogUtil
 from usvlib4ros.user.PP0_2 import PPO, device
-from usvlib4ros.user.reward import RewardConfig, compute_reward
+from usvlib4ros.user.reward import RewardConfig, compute_reward, calc_apf_heading_diff
 from usvlib4ros.user.training_logger import TrainingLogger
 
 # ==================== 超参数配置 ====================
@@ -28,7 +29,7 @@ MEMORY_CAPACITY = 2000
 BATCH_SIZE = 128
 LR_ACTOR = 0.0003
 LR_CRITIC = 0.001
-GAMMA = 0.99           # 折扣因子
+GAMMA = 0.9           # 折扣因子
 K_EPOCHS = 80          # PPO更新轮数
 EPS_CLIP = 0.2         # PPO裁剪系数
 ACTION_STD_INIT = 0.6  # 连续动作标准差初始化(当前未启用连续空间)
@@ -41,8 +42,8 @@ CHECKPOINT_INTERVAL = 100  # 模型保存间隔(轮数)
 # ==================== 导航常量 ====================
 LASER_MAX_RANGE = 5.0        # 激光雷达有效最大距离(m)
 LASER_FRONT_HALF_DEG = 180   # 前方扫描扇区角度(度),仅用于碰撞检测
-COLLISION_DISTANCE = 0.5     # 碰撞判定阈值(m)
-ARRIVE_DISTANCE = 1.0        # 到达目标判定阈值(m)
+COLLISION_DISTANCE = 0.6     # 碰撞判定阈值(m)
+ARRIVE_DISTANCE = 1.5        # 到达目标判定阈值(m)
 DEFAULT_SPEED = 1.0          # 默认速度(m/s)
 OBSTACLE_SLOW_RANGE = 4.0    # 进入此范围开始减速(m)
 TARGET_SLOW_RANGE = 3.0      # 接近目标时减速阈值(m)
@@ -54,15 +55,17 @@ CONTROL_DT = 0.1             # 控制周期(s),用于连续动作
 TARGET_ECHO_ANGLE_WINDOW_DEG = 8.0   # 屏蔽目标回波时的角度窗口(度)
 TARGET_ECHO_RANGE_MARGIN = 1.0       # 屏蔽目标回波时的距离容差(m)
 TARGET_ECHO_MIN_DISTANCE = 0.5       # 太近时不再做目标回波屏蔽，避免穿障
+ENABLE_APF_DEBUG_VIEW = True         # 是否打开APF方向实时调试窗口
+APF_DEBUG_WINDOW_NAME = "APF Heading Debug"
 
 # ==================== 奖励权重 ====================
 REWARD_ARRIVE_BONUS = 1000      # 到达奖励
 REWARD_COLLISION_PENALTY = -500 # 碰撞惩罚
 REWARD_OBSTACLE_PENALTY = -5    # 接近障碍物惩罚
 REWARD_NEAR_TARGET_BONUS = 1    # 靠近目标奖励
-REWARD_WEIGHT_DISTANCE = 0.8    # 距离奖励权重
-REWARD_WEIGHT_OBSTACLE = 0.4    # 障碍物惩罚权重
-REWARD_WEIGHT_HEADING = 0.4     # 航向奖励权重
+REWARD_WEIGHT_DISTANCE = 0.6    # 距离奖励权重
+REWARD_WEIGHT_OBSTACLE = 0.5    # 障碍物惩罚权重
+REWARD_WEIGHT_HEADING = 0.3     # 航向奖励权重
 
 
 @dataclass
@@ -106,6 +109,7 @@ class PPONav:
         self._init_csv_file()
 
         self.last_distance = None
+        self.enable_apf_debug_view = ENABLE_APF_DEBUG_VIEW
 
         # PPO智能体
         self.ppo_agent = PPO(
@@ -309,11 +313,18 @@ class PPONav:
         """
         从激光雷达数据提取特征,仅取前方180°扇区用于碰撞检测。
 
-        保持原有采样方式：直接取ranges前180个点并按2步长降采样。
+        先将 90~180° 的数据接到 0~90° 前面，再从重排后的 0~180° 中按 2 步长采样，
+        保持输出长度稳定为 90 个点。
         """
         scan_range = []
-        for i in range(0, min(len(scan.ranges), 180), 2):
-            value = scan.ranges[i]
+        ranges = list(scan.ranges)
+        if len(ranges) >= 180:
+            reordered_ranges = ranges[90:180] + ranges[0:90]
+        else:
+            reordered_ranges = ranges
+
+        for i in range(0, min(len(reordered_ranges), 180), 2):
+            value = reordered_ranges[i]
             if value == float('Inf') or value is None or np.isnan(value) or value > LASER_MAX_RANGE:
                 scan_range.append(LASER_MAX_RANGE)
             else:
@@ -436,6 +447,7 @@ class PPONav:
             angle_diff=new_state[-4],
             arrive=self.arrive,
             done=self.done,
+            prev_state=state,
             prev_distance=prev_distance,
             heading_world=heading,
             target_heading_world=degreeAship,
@@ -443,6 +455,14 @@ class PPONav:
             config=self.reward_config,
         )
         reward = breakdown.total_reward
+        self._update_apf_debug_view(
+            prev_state=state,
+            new_state=new_state,
+            heading=heading,
+            target_heading_world=degreeAship,
+            action=action,
+            reward=reward,
+        )
 
         # reward = compute_reward(
         #     state=new_state,
@@ -510,6 +530,187 @@ class PPONav:
             adviseSpeed = min(round(adviseSpeed * 100 / DEFAULT_SPEED, 0), 100)
 
         return adviseRotate, adviseSpeed
+
+    @staticmethod
+    def _sim_deg_to_canvas_deg(angle_deg: float) -> float:
+        """将仿真角度转换为画布角度：仿真0°朝上，画布0°朝右。"""
+        return (90.0 - angle_deg) % 360.0
+
+    @staticmethod
+    def _world_deg_to_canvas_point(center: tuple[int, int], length: float, angle_deg: float) -> tuple[int, int]:
+        angle_rad = math.radians(angle_deg)
+        x = center[0] + length * math.cos(angle_rad)
+        y = center[1] - length * math.sin(angle_rad)
+        return int(round(x)), int(round(y))
+
+    def _draw_debug_arrow(
+        self,
+        canvas: np.ndarray,
+        center: tuple[int, int],
+        length: float,
+        angle_deg: float,
+        color: tuple[int, int, int],
+        label: str,
+    ) -> None:
+        canvas_angle = self._sim_deg_to_canvas_deg(angle_deg)
+        end = self._world_deg_to_canvas_point(center, length, canvas_angle)
+        cv2.arrowedLine(canvas, center, end, color, 2, tipLength=0.14)
+        text_pos = self._world_deg_to_canvas_point(center, length + 18, canvas_angle)
+        cv2.putText(canvas, label, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+
+    def _draw_debug_point(
+        self,
+        canvas: np.ndarray,
+        center: tuple[int, int],
+        distance_m: float,
+        angle_deg: float,
+        color: tuple[int, int, int],
+        radius: int = 3,
+    ) -> None:
+        """按仿真角度和距离，在画布上画出一个采样点。"""
+        canvas_angle = self._sim_deg_to_canvas_deg(angle_deg)
+        point_radius = min(220.0, 30.0 + float(distance_m) * 45.0)
+        point = self._world_deg_to_canvas_point(center, point_radius, canvas_angle)
+        cv2.circle(canvas, point, radius, color, -1)
+
+    def _update_apf_debug_view(
+        self,
+        prev_state: list,
+        new_state: list,
+        heading: float,
+        target_heading_world: float,
+        action: np.ndarray,
+        reward: float,
+    ) -> None:
+        if not self.enable_apf_debug_view:
+            return
+
+        try:
+            heading_world = self._normalize_heading_360(heading)
+            target_world = self._normalize_heading_360(target_heading_world)
+            prev_apf_heading_diff = calc_apf_heading_diff(
+                angle_diff=prev_state[-4],
+                current_distance=prev_state[-3],
+                obstacle_min_range=prev_state[-2],
+                obstacle_angle=prev_state[-1],
+                heading_world=heading_world,
+                target_heading_world=target_world,
+                config=self.reward_config,
+            )
+            curr_apf_heading_diff = calc_apf_heading_diff(
+                angle_diff=new_state[-4],
+                current_distance=new_state[-3],
+                obstacle_min_range=new_state[-2],
+                obstacle_angle=new_state[-1],
+                heading_world=heading_world,
+                target_heading_world=target_world,
+                config=self.reward_config,
+            )
+
+            action_vec = np.asarray(action, dtype=np.float32).reshape(-1)
+            turn_action = float(action_vec[0]) if action_vec.size > 0 else 0.0
+            predicted_apf_heading_diff = self._normalize_signed_angle_diff(
+                curr_apf_heading_diff - turn_action * ANGULAR_VELOCITY_MAX * CONTROL_DT
+            )
+
+            canvas = np.full((720, 760, 3), 248, dtype=np.uint8)
+            center = (380, 380)
+            cv2.circle(canvas, center, 230, (225, 225, 225), 1)
+            cv2.circle(canvas, center, 4, (30, 30, 30), -1)
+
+            self._draw_debug_arrow(canvas, center, 130, heading_world, (50, 50, 50), "ship")
+            self._draw_debug_arrow(canvas, center, 180, target_world, (40, 160, 40), "target")
+            self._draw_debug_arrow(canvas, center, 220, heading_world + curr_apf_heading_diff, (30, 80, 220), "apf_now")
+            self._draw_debug_arrow(canvas, center, 150, heading_world + predicted_apf_heading_diff, (180, 60, 180), "apf_pred")
+
+            laser_count = max(0, len(new_state) - 6)
+            laser_points = np.asarray(new_state[:laser_count], dtype=np.float32)
+            if laser_points.size > 0:
+                obstacle_idx = int(np.argmin(laser_points))
+                for idx, beam_range in enumerate(laser_points):
+                    # 源代码中的前方180°扇区按2°采样，这里按索引还原角度。
+                    relative_deg = -90.0 + idx * 2.0
+                    point_color = (30, 30, 200) if idx == obstacle_idx else (120, 120, 120)
+                    point_radius = 4 if idx == obstacle_idx else 2
+                    self._draw_debug_point(
+                        canvas,
+                        center,
+                        float(beam_range),
+                        heading_world + relative_deg,
+                        point_color,
+                        radius=point_radius,
+                    )
+
+                obstacle_angle_idx = float(new_state[-1])
+                obstacle_relative_deg = obstacle_angle_idx * 2.0 - 90.0
+                if 0 <= int(round(obstacle_angle_idx)) < laser_points.size:
+                    obstacle_point_range = float(laser_points[int(round(obstacle_angle_idx))])
+                    self._draw_debug_point(
+                        canvas,
+                        center,
+                        obstacle_point_range,
+                        heading_world + obstacle_relative_deg,
+                        (20, 140, 255),
+                        radius=5,
+                    )
+                    obstacle_point = self._world_deg_to_canvas_point(
+                        center,
+                        min(220.0, 30.0 + obstacle_point_range * 45.0),
+                        self._sim_deg_to_canvas_deg(heading_world + obstacle_relative_deg),
+                    )
+                    cv2.putText(
+                        canvas,
+                        "obstacle_angle",
+                        (obstacle_point[0] + 10, obstacle_point[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (20, 140, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
+
+            debug_lines = [
+                f"heading_world: {heading_world:.2f} deg",
+                f"target_heading_world: {target_world:.2f} deg",
+                f"prev_angle_diff: {prev_state[-4]:.2f} deg",
+                f"curr_angle_diff: {new_state[-4]:.2f} deg",
+                f"obstacle_angle(index): {new_state[-1]:.2f}",
+                f"obstacle_angle(relative): {obstacle_relative_deg:.2f} deg",
+                f"obstacle_min_range: {new_state[-2]:.2f} m",
+                f"prev_apf_heading_diff: {prev_apf_heading_diff:.2f} deg",
+                f"curr_apf_heading_diff: {curr_apf_heading_diff:.2f} deg",
+                f"pred_apf_heading_diff: {predicted_apf_heading_diff:.2f} deg",
+                f"laser_points: {laser_count}",
+                f"turn_action: {turn_action:.3f}",
+                f"reward: {reward:.3f}",
+            ]
+            for idx, line in enumerate(debug_lines):
+                cv2.putText(
+                    canvas,
+                    line,
+                    (24, 32 + idx * 26),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.58,
+                    (20, 20, 20),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+            cv2.putText(
+                canvas,
+                "sim 0 deg -> up, canvas 0 deg -> right",
+                (24, 695),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (90, 90, 90),
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.imshow(APF_DEBUG_WINDOW_NAME, canvas)
+            cv2.waitKey(1)
+        except Exception as exc:
+            self.enable_apf_debug_view = False
+            LogUtil.error(f"APF debug view disabled: {exc}")
 
     # ==================== 奖励函数 ====================
 
@@ -851,6 +1052,8 @@ class PPONav:
                 ])
 
     def close(self):
+        if getattr(self, "enable_apf_debug_view", False):
+            cv2.destroyAllWindows()
         if hasattr(self, "training_logger") and self.training_logger is not None:
             self.training_logger.close()
 

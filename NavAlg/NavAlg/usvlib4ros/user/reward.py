@@ -15,7 +15,7 @@ class RewardConfig:
     obstacle_penalty_scale: float = 10.0
     step_penalty: float = -0.01
     max_episode_time: float = 300.0
-    min_arrive_time_weight: float = 0.5
+    min_arrive_time_weight: float = 0.2
     target_slow_range: float = 3.0
     angular_velocity_max: float = 100
     control_dt: float = 0.1
@@ -23,7 +23,7 @@ class RewardConfig:
     n_actions: int = 1
     speed_scale: float = 100.0
     apf_attractive_gain: float = 1.0
-    apf_repulsive_gain: float = 1.0
+    apf_repulsive_gain: float = 4.0
     apf_obstacle_influence_range: float = 3.0
     apf_heading_repulsive_weight: float = 1.0
 
@@ -49,6 +49,7 @@ def compute_reward(
     angle_diff: float,
     arrive: bool,
     done: bool,
+    prev_state: list | None = None,
     prev_distance: float | None = None,
     heading_world: float | None = None,
     target_heading_world: float | None = None,
@@ -62,6 +63,7 @@ def compute_reward(
         angle_diff=angle_diff,
         arrive=arrive,
         done=done,
+        prev_state=prev_state,
         prev_distance=prev_distance,
         heading_world=heading_world,
         target_heading_world=target_heading_world,
@@ -77,6 +79,7 @@ def compute_reward_breakdown(
     angle_diff: float,
     arrive: bool,
     done: bool,
+    prev_state: list | None = None,
     prev_distance: float | None = None,
     heading_world: float | None = None,
     target_heading_world: float | None = None,
@@ -99,6 +102,7 @@ def compute_reward_breakdown(
         angle_diff=angle_diff if angle_diff is not None else state[-4],
         current_distance=current_distance,
         max_distance=max_distance,
+        prev_state=prev_state,
         obstacle_min_range=obstacle_min_range,
         obstacle_angle=obstacle_angle,
         heading_world=heading_world,
@@ -204,7 +208,7 @@ def calc_time_reward_weight(
 
     return config.min_arrive_time_weight + (
         1.0 - config.min_arrive_time_weight
-    ) * ((1.0 - progress) ** 2)
+    ) * math.exp(-4 * progress)
 
 
 def calc_progress_reward(prev_distance: float | None, current_distance: float) -> float:
@@ -262,6 +266,7 @@ def calc_apf_heading_reward(
     angle_diff: float,
     current_distance: float,
     max_distance: float,
+    prev_state: list | None,
     obstacle_min_range: float,
     obstacle_angle: float,
     heading_world: float | None,
@@ -292,8 +297,27 @@ def calc_apf_heading_reward(
     predicted_heading_diff = _normalize_signed_angle_diff(
         apf_heading_diff - turn_action * config.angular_velocity_max * config.control_dt
     )
-    heading_reward = 1 - 2 * (abs(predicted_heading_diff) / 180.0)
-    return round(heading_reward, 2) * distance_rate
+    if prev_state is None or len(prev_state) < 4:
+        heading_reward = 1 - 2 * (abs(predicted_heading_diff) / 180.0)
+        return round(heading_reward, 2) * distance_rate
+
+    prev_angle_diff = prev_state[-4]
+    prev_current_distance = prev_state[-3]
+    prev_obstacle_min_range = prev_state[-2]
+    prev_obstacle_angle = prev_state[-1]
+    prev_apf_heading_diff = calc_apf_heading_diff(
+        angle_diff=prev_angle_diff,
+        current_distance=prev_current_distance,
+        obstacle_min_range=prev_obstacle_min_range,
+        obstacle_angle=prev_obstacle_angle,
+        heading_world=heading_world,
+        target_heading_world=target_heading_world,
+        config=config,
+    )
+    prev_align = math.cos(math.radians(prev_apf_heading_diff))
+    curr_align = math.cos(math.radians(predicted_heading_diff))
+    heading_progress = curr_align - prev_align
+    return round(heading_progress * 2.0, 2)
 
 
 def calc_apf_heading_diff(

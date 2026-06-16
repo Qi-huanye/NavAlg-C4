@@ -109,6 +109,11 @@ class ActorCritic(nn.Module):
             torch.isnan(t) | torch.isinf(t), torch.zeros_like(t), t
         )
 
+    def _get_log_std(self, learnable: bool) -> torch.Tensor:
+        """在启用前冻结 log_std，首次到达后再允许其参与梯度更新。"""
+        log_std = torch.clamp(self.log_std, min=-2.5, max=0.5)
+        return log_std if learnable else log_std.detach()
+
     def act(self, state: torch.Tensor):
         """根据当前状态采样一个动作,并返回动作及其对数概率(不计算梯度)。
 
@@ -125,7 +130,7 @@ class ActorCritic(nn.Module):
             # 连续动作空间:Actor 输出动作均值,使用对角协方差矩阵构建正态分布
             raw = self.actor(state)
             action_mean = self._get_action_mean(raw)
-            log_std = torch.clamp(self.log_std, min=-2.5, max=0.5)
+            log_std = self._get_log_std(learnable=True)
             std = torch.exp(log_std)  # 标准差向量
             scale_tril = torch.diag(std)
             dist = MultivariateNormal(action_mean, scale_tril=scale_tril)
@@ -141,7 +146,7 @@ class ActorCritic(nn.Module):
         action = dist.sample()
         return action.detach(), dist.log_prob(action).detach()
 
-    def evaluate(self, state: torch.Tensor, action: torch.Tensor):
+    def evaluate(self, state: torch.Tensor, action: torch.Tensor, learnable_std: bool = True):
         """评估给定状态-动作对的对数概率、状态价值以及分布的熵。
 
         用于 PPO 更新阶段,根据旧策略收集的数据计算新策略的相关量。
@@ -161,7 +166,7 @@ class ActorCritic(nn.Module):
             raw = self._sanitize_tensor(self.actor(state))
             action_mean = self._get_action_mean(raw)
             action_mean = self._sanitize_tensor(action_mean)
-            log_std = torch.clamp(self.log_std, min=-2.5, max=0.5)
+            log_std = self._get_log_std(learnable=learnable_std)
             std = torch.exp(log_std)                         # 标准差向量
             # 扩展到批次维度：将 (action_dim,) 复制到 (batch, action_dim)
             std_batch = std.unsqueeze(0).expand(action_mean.size(0), -1)
@@ -345,7 +350,7 @@ class PPO:
             "critic_loss": critic_loss_value,
             "total_loss": total_loss_value,
             "entropy": entropy_value,
-            "buffer_size": len(self.buffer.rewards),
+            "buffer_size": len(rewards),
         }
 
     def load(self, checkpoint_path: str):
