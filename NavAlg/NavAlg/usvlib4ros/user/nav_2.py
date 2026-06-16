@@ -1,9 +1,12 @@
-import math
+﻿import math
 import time
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import csv
+import cv2
 
 import numpy as np
 import torch
@@ -15,8 +18,9 @@ from usvlib4ros.msg.parameter import Parameter
 from usvlib4ros.usvRosUtil import LogUtil
 from usvlib4ros.user.episode_logging import EpisodeDataLogger
 from usvlib4ros.user.PP0_2 import PPO, device
-from usvlib4ros.user.reward import RewardConfig, compute_reward
+from usvlib4ros.user.reward import RewardConfig, compute_reward_breakdown, RewardBreakdown, calc_apf_heading_diff
 from usvlib4ros.user.tensorboard_logging import TensorBoardMetricsWriter, build_tensorboard_log_dir
+from usvlib4ros.user.training_logger import TrainingLogger
 
 # ==================== 超参数配置 ====================
 N_ACTIONS = 2          # 连续动作空间
@@ -26,7 +30,7 @@ MEMORY_CAPACITY = 2000
 BATCH_SIZE = 128
 LR_ACTOR = 0.0003
 LR_CRITIC = 0.001
-GAMMA = 0.99           # 折扣因子
+GAMMA = 0.9           # 折扣因子
 K_EPOCHS = 80          # PPO更新轮数
 EPS_CLIP = 0.2         # PPO裁剪系数
 ACTION_STD_INIT = 0.6  # 连续动作标准差初始化(当前未启用连续空间)
@@ -41,7 +45,7 @@ RESET_SETTLE_DELAY = 3.0  # 每轮复位后等待仿真刷新(秒)
 LASER_MAX_RANGE = 5.0        # 激光雷达有效最大距离(m)
 LASER_FRONT_HALF_DEG = 180   # 前方扫描扇区角度(度),仅用于碰撞检测
 COLLISION_DISTANCE = 0.6     # 碰撞判定阈值(m)
-ARRIVE_DISTANCE = 1.0        # 到达目标判定阈值(m)
+ARRIVE_DISTANCE = 1.5        # 到达目标判定阈值(m)
 DEFAULT_SPEED = 1.0          # 默认速度(m/s)
 OBSTACLE_SLOW_RANGE = 4.0    # 进入此范围开始减速(m)
 TARGET_SLOW_RANGE = 3.0      # 接近目标时减速阈值(m)
@@ -53,6 +57,8 @@ CONTROL_DT = 0.1             # 控制周期(s),用于连续动作
 TARGET_ECHO_ANGLE_WINDOW_DEG = 8.0
 TARGET_ECHO_RANGE_MARGIN = 1.0
 TARGET_ECHO_MIN_DISTANCE = 0.5
+ENABLE_APF_DEBUG_VIEW = True         # 是否打开APF方向实时调试窗口
+APF_DEBUG_WINDOW_NAME = "APF Heading Debug"
 
 # ==================== 奖励权重 ====================
 REWARD_ARRIVE_BONUS = 1000      # 到达奖励
@@ -60,8 +66,8 @@ REWARD_COLLISION_PENALTY = -500 # 碰撞惩罚
 REWARD_OBSTACLE_PENALTY = -5    # 接近障碍物惩罚
 REWARD_NEAR_TARGET_BONUS = 1    # 靠近目标奖励
 REWARD_WEIGHT_DISTANCE = 0.6    # 距离奖励权重
-REWARD_WEIGHT_OBSTACLE = 0.2    # 障碍物惩罚权重
-REWARD_WEIGHT_HEADING = 0.2     # 航向奖励权重
+REWARD_WEIGHT_OBSTACLE = 0.5    # 障碍物惩罚权重
+REWARD_WEIGHT_HEADING = 0.3     # 航向奖励权重
 
 
 @dataclass
@@ -73,6 +79,11 @@ class StepResult:
     advise_speed: float
     advise_rotate: float
     advised_heading: float
+    distance: float
+    degree_aship: float
+    obstacle_min_range: float
+    obstacle_angle: float
+    breakdown: RewardBreakdown
 
 
 class PPONav:
@@ -97,6 +108,17 @@ class PPONav:
         self.episode_log_dir = Path.cwd() / "logs"
         self.episode_logger = None
 
+        # 数据收集控制
+        self.data_collection_count = 0
+        self.data_collection_max = 100
+        self.data_collection_enabled = True
+        self.training_logger = TrainingLogger(root_dir="Results", summary_interval=50)
+        self.csv_path = self.training_logger.run_dir / "data_collection.csv"
+        self._init_csv_file()
+
+        self.last_distance = None
+        self.enable_apf_debug_view = ENABLE_APF_DEBUG_VIEW
+
         # PPO智能体
         self.ppo_agent = PPO(
             N_STATES, N_ACTIONS, LR_ACTOR, LR_CRITIC,
@@ -119,7 +141,9 @@ class PPONav:
         self.episode_reward_sum = 0.0
         self.arrive = False
         self.done = False
+        self.timeout = False
         self.arrive_distance = ARRIVE_DISTANCE
+        self.episode_step_count = 0
 
         self.routePlaneService = RoutePlanService(
             wayPointRadius=self.arrive_distance, route=self.route
@@ -154,6 +178,7 @@ class PPONav:
                     try:
                         LogUtil.info(f"第 {epoch} 轮训练开始")
                         self._start_episode_logging(epoch)
+                        last_update_metrics = None
 
                         # 复位Unity环境
                         self.ros_ctrl.reset_unity()
@@ -180,21 +205,29 @@ class PPONav:
 
                         # 本轮导航循环
                         self.episode_start_time = time.time()
+                        self.episode_step_count = 0
+                        self.timeout = False
                         for step in range(MAX_STEP_PER_EPISODE):
                             self.current_episode_step = step + 1
+                            self.episode_step_count = self.current_episode_step
                             if self.global_data.device_data.task_status == 0:
                                 LogUtil.info(f"步骤 {step} 停止训练")
                                 break
 
                             if (time.time() - self.episode_start_time) > MAX_EPISODE_TIME:
                                 LogUtil.info("本轮超时,提前结束")
+                                self.timeout = True
                                 break
 
                             self.done = self.navigationHandler(self.next_state, epoch, step)
 
                             # 定期更新PPO
                             if step > 0 and step % UPDATE_INTERVAL == 0:
-                                self.ppo_agent.update()
+                                last_update_metrics = self.ppo_agent.update()
+                                self.training_logger.log_update(
+                                    epoch * MAX_STEP_PER_EPISODE + step,
+                                    last_update_metrics,
+                                )
 
                             self.setMonitorParameterValue()
 
@@ -207,11 +240,29 @@ class PPONav:
                         if not self.done and not self.arrive and self.current_episode_step > 0:
                             self._log_episode_metrics(epoch)
 
+                        if self.ppo_agent.buffer.rewards:
+                            last_update_metrics = self.ppo_agent.update()
+                            self.training_logger.log_update(
+                                epoch * MAX_STEP_PER_EPISODE + self.episode_step_count,
+                                last_update_metrics,
+                            )
+
                         # 定期保存模型
                         if epoch % CHECKPOINT_INTERVAL == 0:
-                            checkpoint_path = f"./PPO_ship_obstacle_{epoch}.pth"
+                            checkpoint_path = self.training_logger.checkpoint_dir / f"PPO_ship_obstacle_{epoch}.pth"
                             self.ppo_agent.save(checkpoint_path)
                             LogUtil.info(f"模型已保存: {checkpoint_path}")
+
+                        self.training_logger.log_episode(
+                            episode=epoch,
+                            episode_return=self.episode_reward_sum,
+                            steps=self.episode_step_count,
+                            episode_time_sec=(time.time() - self.episode_start_time) if self.episode_start_time else 0.0,
+                            arrived=self.arrive,
+                            collided=self.done and not self.arrive,
+                            timeout=self.timeout and not self.done and not self.arrive,
+                            last_update_metrics=last_update_metrics,
+                        )
                     finally:
                         self._close_episode_logging()
 
@@ -220,6 +271,7 @@ class PPONav:
             finally:
                 self._close_episode_logging()
                 self._close_tensorboard_writer()
+                self.training_logger.close()
                 time.sleep(2)
 
     def _reset_episode_state(self):
@@ -227,11 +279,14 @@ class PPONav:
         self.episode_reward_sum = 0.0
         self.current_episode_step = 0
         self.next_state = None
+        self.last_distance = None
         self.done = False
         self.arrive = False
+        self.timeout = False
         self.destPointIndex = -1
         self.destPoint = None
         self.max_distance = 0.0
+        self.episode_step_count = 0
 
     # ==================== 状态获取 ====================
 
@@ -280,23 +335,23 @@ class PPONav:
         """
         从激光雷达数据提取特征,仅取前方180°扇区用于碰撞检测。
 
-        假设ROS LaserScan的ranges按角度顺序排列,中间索引对应船体正前方。
-        取中间180°范围内的数据点。
+        先将 90~180° 的数据接到 0~90° 前面，再从重排后的 0~180° 中按 2 步长采样，
+        保持输出长度稳定为 90 个点。
         """
-        total_points = len(scan.ranges)
-        # 前方180°占总扫描范围的一半,取数组中间部分
-        half_count = total_points // 2
-        start_idx = half_count // 2          # 前90°起始索引
-        end_idx = start_idx + half_count     # 后90°结束索引
-
         scan_range = []
-        for i in range(0, 180 ,2):
-            value = scan.ranges[i]
+        ranges = list(scan.ranges)
+        if len(ranges) >= 180:
+            reordered_ranges = ranges[90:180] + ranges[0:90]
+        else:
+            reordered_ranges = ranges
+
+        for i in range(0, min(len(reordered_ranges), 180), 2):
+            value = reordered_ranges[i]
             if value == float('Inf') or value is None or np.isnan(value) or value > LASER_MAX_RANGE:
                 scan_range.append(LASER_MAX_RANGE)
             else:
                 scan_range.append(value)
-        return scan_range
+        return scan_range if scan_range else [LASER_MAX_RANGE]
 
     def _extract_obstacle_feature(
         self,
@@ -304,6 +359,7 @@ class PPONav:
         angle_diff: float,
         current_distance: float,
     ) -> tuple[float, float]:
+        """提取障碍物特征，并尽量排除目标点方向上的回波。"""
         if not scan_range:
             return LASER_MAX_RANGE, 0.0
 
@@ -314,11 +370,14 @@ class PPONav:
             start = max(0, target_index - window_bins)
             end = min(len(filtered_scan), target_index + window_bins + 1)
             for idx in range(start, end):
-                if abs(filtered_scan[idx] - current_distance) <= TARGET_ECHO_RANGE_MARGIN:
+                beam_range = filtered_scan[idx]
+                if abs(beam_range - current_distance) <= TARGET_ECHO_RANGE_MARGIN:
                     filtered_scan[idx] = LASER_MAX_RANGE
 
         obstacle_idx = int(np.argmin(filtered_scan))
         obstacle_min_range = round(float(filtered_scan[obstacle_idx]), 2)
+
+        # 如果整段都被屏蔽掉了，回退到原始最近点，避免状态失真。
         if obstacle_min_range >= LASER_MAX_RANGE:
             obstacle_idx = int(np.argmin(scan_range))
             obstacle_min_range = round(float(scan_range[obstacle_idx]), 2)
@@ -326,6 +385,7 @@ class PPONav:
         return obstacle_min_range, float(obstacle_idx)
 
     def _target_angle_to_scan_index(self, angle_diff: float, scan_len: int) -> int | None:
+        """将目标相对航向角映射到前向180度扫描索引。"""
         if scan_len <= 0:
             return None
         if angle_diff < -90.0 or angle_diff > 90.0:
@@ -376,7 +436,7 @@ class PPONav:
         return round(distance * 6378.137 * 1000, 1)
 
     def step(self, state: list, action: np.ndarray, laser_scan, heading: float,
-             shipToNextWPDistance: float,degreeAship: float, max_distance: float) -> StepResult:
+             shipToNextWPDistance: float,degreeAship: float, max_distance: float,prev_distance: float) -> StepResult:
         """
         执行动作并获取环境反馈。
 
@@ -430,19 +490,41 @@ class PPONav:
             refreshed_speed,
             refreshed_rotate_speed,
         )
-        reward = compute_reward(
+
+        # 使用分解函数
+        breakdown = compute_reward_breakdown(
             state=new_state,
             action=action,
             max_distance=max_distance,
             angle_diff=new_state[-4],
             arrive=self.arrive,
             done=self.done,
-            prev_distance=current_distance,
+            prev_state=state,
+            prev_distance=prev_distance,
             episode_elapsed_time=time.time() - self.episode_start_time,
             heading_world=refreshed_heading,
             target_heading_world=refreshed_degreeAship,
             config=self.reward_config,
         )
+        reward = breakdown.total_reward
+        self._update_apf_debug_view(
+            prev_state=state,
+            new_state=new_state,
+            heading=heading,
+            target_heading_world=degreeAship,
+            action=action,
+            reward=reward,
+        )
+
+        # reward = compute_reward(
+        #     state=new_state,
+        #     action=action,
+        #     max_distance=max_distance,
+        #     angle_diff=new_state[-4],
+        #     arrive=self.arrive,
+        #     done=self.done,
+        #     config=self.reward_config,
+        # )
         if self.arrive:
             LogUtil.info("到达目标!")
         elif self.done:
@@ -455,6 +537,11 @@ class PPONav:
             advise_speed=adviseSpeed,
             advise_rotate=adviseRotate,
             advised_heading=heading,
+            distance=shipToNextWPDistance,
+            degree_aship=degreeAship,
+            obstacle_min_range=state[-2],
+            obstacle_angle=state[-1],
+            breakdown=breakdown,
         )
 
     def _action_to_control(self, action: np.ndarray, obstacle_min_range: float,
@@ -495,6 +582,187 @@ class PPONav:
             adviseSpeed = min(round(adviseSpeed * 100 / DEFAULT_SPEED, 0), 100)
 
         return adviseRotate, adviseSpeed
+
+    @staticmethod
+    def _sim_deg_to_canvas_deg(angle_deg: float) -> float:
+        """将仿真角度转换为画布角度：仿真0°朝上，画布0°朝右。"""
+        return (90.0 - angle_deg) % 360.0
+
+    @staticmethod
+    def _world_deg_to_canvas_point(center: tuple[int, int], length: float, angle_deg: float) -> tuple[int, int]:
+        angle_rad = math.radians(angle_deg)
+        x = center[0] + length * math.cos(angle_rad)
+        y = center[1] - length * math.sin(angle_rad)
+        return int(round(x)), int(round(y))
+
+    def _draw_debug_arrow(
+        self,
+        canvas: np.ndarray,
+        center: tuple[int, int],
+        length: float,
+        angle_deg: float,
+        color: tuple[int, int, int],
+        label: str,
+    ) -> None:
+        canvas_angle = self._sim_deg_to_canvas_deg(angle_deg)
+        end = self._world_deg_to_canvas_point(center, length, canvas_angle)
+        cv2.arrowedLine(canvas, center, end, color, 2, tipLength=0.14)
+        text_pos = self._world_deg_to_canvas_point(center, length + 18, canvas_angle)
+        cv2.putText(canvas, label, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+
+    def _draw_debug_point(
+        self,
+        canvas: np.ndarray,
+        center: tuple[int, int],
+        distance_m: float,
+        angle_deg: float,
+        color: tuple[int, int, int],
+        radius: int = 3,
+    ) -> None:
+        """按仿真角度和距离，在画布上画出一个采样点。"""
+        canvas_angle = self._sim_deg_to_canvas_deg(angle_deg)
+        point_radius = min(220.0, 30.0 + float(distance_m) * 45.0)
+        point = self._world_deg_to_canvas_point(center, point_radius, canvas_angle)
+        cv2.circle(canvas, point, radius, color, -1)
+
+    def _update_apf_debug_view(
+        self,
+        prev_state: list,
+        new_state: list,
+        heading: float,
+        target_heading_world: float,
+        action: np.ndarray,
+        reward: float,
+    ) -> None:
+        if not self.enable_apf_debug_view:
+            return
+
+        try:
+            heading_world = self._normalize_heading_360(heading)
+            target_world = self._normalize_heading_360(target_heading_world)
+            prev_apf_heading_diff = calc_apf_heading_diff(
+                angle_diff=prev_state[-4],
+                current_distance=prev_state[-3],
+                obstacle_min_range=prev_state[-2],
+                obstacle_angle=prev_state[-1],
+                heading_world=heading_world,
+                target_heading_world=target_world,
+                config=self.reward_config,
+            )
+            curr_apf_heading_diff = calc_apf_heading_diff(
+                angle_diff=new_state[-4],
+                current_distance=new_state[-3],
+                obstacle_min_range=new_state[-2],
+                obstacle_angle=new_state[-1],
+                heading_world=heading_world,
+                target_heading_world=target_world,
+                config=self.reward_config,
+            )
+
+            action_vec = np.asarray(action, dtype=np.float32).reshape(-1)
+            turn_action = float(action_vec[0]) if action_vec.size > 0 else 0.0
+            predicted_apf_heading_diff = self._normalize_signed_angle_diff(
+                curr_apf_heading_diff - turn_action * ANGULAR_VELOCITY_MAX * CONTROL_DT
+            )
+
+            canvas = np.full((720, 760, 3), 248, dtype=np.uint8)
+            center = (380, 380)
+            cv2.circle(canvas, center, 230, (225, 225, 225), 1)
+            cv2.circle(canvas, center, 4, (30, 30, 30), -1)
+
+            self._draw_debug_arrow(canvas, center, 130, heading_world, (50, 50, 50), "ship")
+            self._draw_debug_arrow(canvas, center, 180, target_world, (40, 160, 40), "target")
+            self._draw_debug_arrow(canvas, center, 220, heading_world + curr_apf_heading_diff, (30, 80, 220), "apf_now")
+            self._draw_debug_arrow(canvas, center, 150, heading_world + predicted_apf_heading_diff, (180, 60, 180), "apf_pred")
+
+            laser_count = max(0, len(new_state) - 6)
+            laser_points = np.asarray(new_state[:laser_count], dtype=np.float32)
+            if laser_points.size > 0:
+                obstacle_idx = int(np.argmin(laser_points))
+                for idx, beam_range in enumerate(laser_points):
+                    # 源代码中的前方180°扇区按2°采样，这里按索引还原角度。
+                    relative_deg = -90.0 + idx * 2.0
+                    point_color = (30, 30, 200) if idx == obstacle_idx else (120, 120, 120)
+                    point_radius = 4 if idx == obstacle_idx else 2
+                    self._draw_debug_point(
+                        canvas,
+                        center,
+                        float(beam_range),
+                        heading_world + relative_deg,
+                        point_color,
+                        radius=point_radius,
+                    )
+
+                obstacle_angle_idx = float(new_state[-1])
+                obstacle_relative_deg = obstacle_angle_idx * 2.0 - 90.0
+                if 0 <= int(round(obstacle_angle_idx)) < laser_points.size:
+                    obstacle_point_range = float(laser_points[int(round(obstacle_angle_idx))])
+                    self._draw_debug_point(
+                        canvas,
+                        center,
+                        obstacle_point_range,
+                        heading_world + obstacle_relative_deg,
+                        (20, 140, 255),
+                        radius=5,
+                    )
+                    obstacle_point = self._world_deg_to_canvas_point(
+                        center,
+                        min(220.0, 30.0 + obstacle_point_range * 45.0),
+                        self._sim_deg_to_canvas_deg(heading_world + obstacle_relative_deg),
+                    )
+                    cv2.putText(
+                        canvas,
+                        "obstacle_angle",
+                        (obstacle_point[0] + 10, obstacle_point[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (20, 140, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
+
+            debug_lines = [
+                f"heading_world: {heading_world:.2f} deg",
+                f"target_heading_world: {target_world:.2f} deg",
+                f"prev_angle_diff: {prev_state[-4]:.2f} deg",
+                f"curr_angle_diff: {new_state[-4]:.2f} deg",
+                f"obstacle_angle(index): {new_state[-1]:.2f}",
+                f"obstacle_angle(relative): {obstacle_relative_deg:.2f} deg",
+                f"obstacle_min_range: {new_state[-2]:.2f} m",
+                f"prev_apf_heading_diff: {prev_apf_heading_diff:.2f} deg",
+                f"curr_apf_heading_diff: {curr_apf_heading_diff:.2f} deg",
+                f"pred_apf_heading_diff: {predicted_apf_heading_diff:.2f} deg",
+                f"laser_points: {laser_count}",
+                f"turn_action: {turn_action:.3f}",
+                f"reward: {reward:.3f}",
+            ]
+            for idx, line in enumerate(debug_lines):
+                cv2.putText(
+                    canvas,
+                    line,
+                    (24, 32 + idx * 26),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.58,
+                    (20, 20, 20),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+            cv2.putText(
+                canvas,
+                "sim 0 deg -> up, canvas 0 deg -> right",
+                (24, 695),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (90, 90, 90),
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.imshow(APF_DEBUG_WINDOW_NAME, canvas)
+            cv2.waitKey(1)
+        except Exception as exc:
+            self.enable_apf_debug_view = False
+            LogUtil.error(f"APF debug view disabled: {exc}")
 
     # ==================== 奖励函数 ====================
 
@@ -764,7 +1032,7 @@ class PPONav:
             return 0.0
 
     def _ppo_decision_loop(self, state, episode: int, step: int,
-                           laser_scan, nav_context: dict) -> bool:
+                       laser_scan, nav_context: dict) -> bool:
         """PPO核心决策逻辑。"""
         heading = self._get_current_heading()
         pose = self.global_data.scada_data.pose
@@ -773,7 +1041,12 @@ class PPONav:
 
         # 初始化状态
         if state is None:
-            state = self.getState(laser_scan, heading, nav_context['shipToNextWPDistance'], nav_context['degreeAship'], current_speed, current_rotate_speed)
+            state = self.getState(laser_scan, heading, nav_context['shipToNextWPDistance'],
+                                nav_context['degreeAship'], current_speed, current_rotate_speed)
+
+        # 获取上一步距离（用于进度奖励）
+        current_distance = state[-3] if state is not None else nav_context['shipToNextWPDistance']
+        prev_distance = self.last_distance if self.last_distance is not None else current_distance
 
         state_tensor = torch.FloatTensor(state).to(device)
         action = self.ppo_agent.select_action(state_tensor)
@@ -781,16 +1054,40 @@ class PPONav:
         # 执行动作
         result = self.step(
             state_tensor.cpu().numpy().tolist(), action,
-            laser_scan, heading, nav_context['shipToNextWPDistance'], nav_context['degreeAship'],self.max_distance
+            laser_scan, heading, nav_context['shipToNextWPDistance'],
+            nav_context['degreeAship'], self.max_distance, prev_distance
         )
         self.next_state = result.next_state
+        self.last_distance = result.distance   # 保存当前步距离供下一步使用
 
         # 记录经验
         self.ppo_agent.buffer.rewards.append(result.reward)
         self.ppo_agent.buffer.is_terminals.append(self.done)
         self.episode_reward_sum += result.reward
 
-        # 输出控制量
+        # ---------- 数据收集 CSV ----------
+        if self.data_collection_enabled and self.data_collection_count < self.data_collection_max:
+            done_flag = self.done or self.arrive
+            with open(self.csv_path, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    result.distance,
+                    result.degree_aship,
+                    result.obstacle_min_range,
+                    result.obstacle_angle,
+                    result.breakdown.distance_raw,
+                    result.breakdown.heading_raw,
+                    result.breakdown.obstacle_raw,
+                    result.reward,
+                    int(done_flag)
+                ])
+            self.data_collection_count += 1
+            if self.data_collection_count >= self.data_collection_max:
+                LogUtil.info(f"数据收集完成，已保存 {self.data_collection_count} 条记录至 {self.csv_path}")
+                self.data_collection_enabled = False
+        # ---------------------------------
+
+        # 输出控制量（修复点：补全参数）
         self._output_control_commands(result, episode, step, nav_context['nextPointIndex'])
 
         LogUtil.debug(
@@ -800,11 +1097,9 @@ class PPONav:
 
         if self.done:
             return True
-
         if self.arrive:
             LogUtil.info(f"Episode结束于step={step}, 总奖励={self.episode_reward_sum:.1f}")
             return True
-
         return False
 
     def _get_current_heading(self) -> float:
@@ -890,6 +1185,24 @@ class PPONav:
             if (time.time() - laser_start_time) > timeout:
                 return None
         return self.global_data.laser_data
+    
+    # =================== CSV工具 ====================
+
+    def _init_csv_file(self):
+        if not self.csv_path.exists():
+            with open(self.csv_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "distance", "degreeAship", "obstacle_min_range", "obstacle_angle",
+                    "distance_reward_raw", "heading_reward_raw", "obstacle_reward_raw",
+                    "total_reward", "done"
+                ])
+
+    def close(self):
+        if getattr(self, "enable_apf_debug_view", False):
+            cv2.destroyAllWindows()
+        if hasattr(self, "training_logger") and self.training_logger is not None:
+            self.training_logger.close()
 
 
 # 向后兼容：保留旧类名供main.py等外部引用
