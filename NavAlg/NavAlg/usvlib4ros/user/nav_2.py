@@ -382,15 +382,29 @@ class PPONav:
             obstacle_idx = int(np.argmin(scan_range))
             obstacle_min_range = round(float(scan_range[obstacle_idx]), 2)
 
-        return obstacle_min_range, float(obstacle_idx)
+        return obstacle_min_range, self._scan_feature_index_to_relative_angle(obstacle_idx)
 
     def _target_angle_to_scan_index(self, angle_diff: float, scan_len: int) -> int | None:
         """将目标相对航向角映射到前向180度扫描索引。"""
         if scan_len <= 0:
             return None
-        if angle_diff < -90.0 or angle_diff > 90.0:
+        if angle_diff < -90.0 or angle_diff >= 90.0:
             return None
         raw_index = int(round((angle_diff + 90.0) / 2.0))
+        return max(0, min(scan_len - 1, raw_index))
+
+    @staticmethod
+    def _scan_feature_index_to_relative_angle(index: int | float) -> float:
+        """将重排后的前向雷达特征索引还原为船体系相对角度。"""
+        return float(index) * 2.0 - 90.0
+
+    @staticmethod
+    def _relative_angle_to_scan_feature_index(angle_deg: float, scan_len: int) -> int | None:
+        if scan_len <= 0:
+            return None
+        if angle_deg < -90.0 or angle_deg >= 90.0:
+            return None
+        raw_index = int(round((angle_deg + 90.0) / 2.0))
         return max(0, min(scan_len - 1, raw_index))
 
     def _is_last_waypoint_reached(self, current_distance: float) -> bool:
@@ -510,8 +524,8 @@ class PPONav:
         self._update_apf_debug_view(
             prev_state=state,
             new_state=new_state,
-            heading=heading,
-            target_heading_world=degreeAship,
+            heading=refreshed_heading,
+            target_heading_world=refreshed_degreeAship,
             action=action,
             reward=reward,
         )
@@ -681,7 +695,7 @@ class PPONav:
                 obstacle_idx = int(np.argmin(laser_points))
                 for idx, beam_range in enumerate(laser_points):
                     # 源代码中的前方180°扇区按2°采样，这里按索引还原角度。
-                    relative_deg = -90.0 + idx * 2.0
+                    relative_deg = self._scan_feature_index_to_relative_angle(idx)
                     point_color = (30, 30, 200) if idx == obstacle_idx else (120, 120, 120)
                     point_radius = 4 if idx == obstacle_idx else 2
                     self._draw_debug_point(
@@ -693,10 +707,13 @@ class PPONav:
                         radius=point_radius,
                     )
 
-                obstacle_angle_idx = float(new_state[-1])
-                obstacle_relative_deg = obstacle_angle_idx * 2.0 - 90.0
-                if 0 <= int(round(obstacle_angle_idx)) < laser_points.size:
-                    obstacle_point_range = float(laser_points[int(round(obstacle_angle_idx))])
+                obstacle_relative_deg = float(new_state[-1])
+                obstacle_angle_idx = self._relative_angle_to_scan_feature_index(
+                    obstacle_relative_deg,
+                    laser_points.size,
+                )
+                if obstacle_angle_idx is not None and 0 <= obstacle_angle_idx < laser_points.size:
+                    obstacle_point_range = float(laser_points[obstacle_angle_idx])
                     self._draw_debug_point(
                         canvas,
                         center,
@@ -712,7 +729,7 @@ class PPONav:
                     )
                     cv2.putText(
                         canvas,
-                        "obstacle_angle",
+                        "nearest_lidar_obstacle",
                         (obstacle_point[0] + 10, obstacle_point[1] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
@@ -726,8 +743,8 @@ class PPONav:
                 f"target_heading_world: {target_world:.2f} deg",
                 f"prev_angle_diff: {prev_state[-4]:.2f} deg",
                 f"curr_angle_diff: {new_state[-4]:.2f} deg",
-                f"obstacle_angle(index): {new_state[-1]:.2f}",
-                f"obstacle_angle(relative): {obstacle_relative_deg:.2f} deg",
+                f"obstacle_angle(relative): {new_state[-1]:.2f} deg",
+                f"obstacle_feature_index: {obstacle_angle_idx}",
                 f"obstacle_min_range: {new_state[-2]:.2f} m",
                 f"prev_apf_heading_diff: {prev_apf_heading_diff:.2f} deg",
                 f"curr_apf_heading_diff: {curr_apf_heading_diff:.2f} deg",

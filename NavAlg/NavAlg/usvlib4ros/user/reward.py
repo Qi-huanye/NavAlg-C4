@@ -365,8 +365,7 @@ def calc_apf_heading_diff(
     if rho < rho_0:
         # 斥力大小：k * (1/rho - 1/rho_0) * (1/rho^2)
         force_magnitude = config.apf_repulsive_gain * (1.0 / rho - 1.0 / rho_0) / (rho * rho)
-        # 障碍物相对角度（沿用原有映射：0°→正前方？实际代码中 obstacle_angle*2-90）
-        obstacle_relative_deg = float(obstacle_angle) * 2.0 - 90.0
+        obstacle_relative_deg = float(obstacle_angle)
         obstacle_world_deg = heading_world + obstacle_relative_deg
         obstacle_rad = math.radians(obstacle_world_deg)
         # 斥力方向：从障碍物指向船舶（即与障碍物方向相反）
